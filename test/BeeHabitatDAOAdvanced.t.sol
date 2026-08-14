@@ -111,7 +111,7 @@ contract BeeHabitatDAOAdvancedTest is Test {
 
         uint256 nonce = dao.robotExecutionNonce();
         string memory missionLog = "Deploying atmospheric water generator unit at Tucson Sector Alpha";
-        bytes32 messageHash = keccak256(abi.encodePacked(roomieRobot, address(rewardToken), member1, 500 * 10**18, nonce, missionLog));
+        bytes32 messageHash = keccak256(abi.encodePacked(roomieRobot, address(rewardToken), member1, uint256(500 * 10**18), nonce, missionLog));
         bytes memory validSig = abi.encodePacked(messageHash, bytes32(uint256(1)));
 
         // Unauthorized caller trying to impersonate robot execution
