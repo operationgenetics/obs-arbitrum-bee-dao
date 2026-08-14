@@ -39,7 +39,8 @@ contract BeeHabitatDAO {
     address public constant MASTER_CONTROLLER_WALLET = 0xBe53702c6f57aF155410f883f38f92414d39E3d5;
     IBindingCurveToken public immutable obsToken;
     
-    string public constant DAO_MISSION = "Positively influence the bee population, build new off-grid habitats powered by solar, battery, and atmospheric water generators, collect honey from these habitats, and govern the distribution or utilization of the harvested honey and project resources.";
+    string public constant DAO_MISSION = "Autonomous robotic agents must actively deploy off-grid solar-powered atmospheric water generators and smart beehive modules, maintain habitat humidity and flora growth, harvest surplus honey securely, and enforce continuous on-chain validation until the bee flourishing index reaches target capacity, at which point the mission automatically locks as complete.";
+    
     uint256 public constant FUNDING_GOAL_DAI = 5_000_000_000 * 10**18;
     uint256 public constant MONTHLY_LP_GRANT = 100 * 10**18;
     uint256 public constant PROPOSAL_COST = 50 * 10**18;
@@ -118,7 +119,7 @@ contract BeeHabitatDAO {
     }
 
     function createProposal(string memory description, uint256 durationDays) external {
-        require(!beeTargetReached, "Mission Accomplished");
+        require(!beeTargetReached, "Mission Accomplished: Bee flourishing target reached and locked.");
         require(members[msg.sender].joined, "Only members");
         
         uint256 currentMonth = _getCurrentMonth();
@@ -140,7 +141,7 @@ contract BeeHabitatDAO {
     }
 
     function vote(uint256 proposalId, bool support) external {
-        require(!beeTargetReached, "Mission Accomplished");
+        require(!beeTargetReached, "Mission Accomplished: Bee flourishing target reached and locked.");
         Proposal storage p = proposals[proposalId];
         require(block.timestamp < p.deadline, "Ended");
         require(!hasVotedOnProposal[proposalId][msg.sender], "Already voted");
@@ -210,7 +211,7 @@ contract BeeHabitatDAO {
         uint256 providedNonce, string calldata missionLog, bytes calldata pqcSignature
     ) external {
         require(systemPermanentlyLocked, "Not locked");
-        require(!beeTargetReached, "Halted");
+        require(!beeTargetReached, "Mission Accomplished: Operations halted.");
         require(providedNonce == robotExecutionNonce, "Invalid nonce");
         require(recipient != address(0), "Invalid recipient");
 
@@ -227,7 +228,7 @@ contract BeeHabitatDAO {
         uint256 weightGrams, string calldata locationTag, uint256 providedNonce, bytes calldata pqcSignature
     ) external {
         require(systemPermanentlyLocked, "Not locked");
-        require(!beeTargetReached, "Halted");
+        require(!beeTargetReached, "Mission Accomplished: Harvest halted.");
         require(providedNonce == robotExecutionNonce, "Invalid nonce");
         require(weightGrams > 0, "Invalid weight");
 
@@ -262,7 +263,7 @@ contract BeeHabitatDAO {
 
         if (currentMeasuredIndex >= BEE_FLOURISHING_TARGET_INDEX) {
             beeTargetReached = true;
-            emit BeeFlourishingTargetReached(currentMeasuredIndex, "SUCCESS");
+            emit BeeFlourishingTargetReached(currentMeasuredIndex, "MISSION_SUCCESS_BEE_POPULATION_FLOURISHING");
         }
     }
 }
