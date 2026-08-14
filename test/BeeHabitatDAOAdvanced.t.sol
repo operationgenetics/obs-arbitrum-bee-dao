@@ -55,7 +55,8 @@ contract BeeHabitatDAOAdvancedTest is Test {
         // 1. Initial State & Governance Access Control
         vm.prank(member1);
         dao.joinDAO();
-        assertTrue(dao.members(member1).joined);
+        (bool joined,) = dao.members(member1);
+        assertTrue(joined);
         assertEq(dao.getVotingPower(member1), 100 * 10**18);
 
         // Prevent double joining
@@ -67,7 +68,7 @@ contract BeeHabitatDAOAdvancedTest is Test {
         vm.prank(member1);
         dao.createProposal("Deploy 50 off-grid solar generators and atmospheric water modules", 7);
         
-        (uint256 id, address proposer, , uint256 forVotes, uint256 againstVotes, , uint256 costPaid, uint256 voterCount, bool executed) = dao.getProposalDetails(1);
+        (uint256 id, address proposer, , , , , uint256 costPaid, uint256 voterCount, bool executed) = dao.getProposalDetails(1);
         assertEq(id, 1);
         assertEq(proposer, member1);
         assertEq(costPaid, 50 * 10**18);
@@ -111,7 +112,7 @@ contract BeeHabitatDAOAdvancedTest is Test {
         uint256 nonce = dao.robotExecutionNonce();
         string memory missionLog = "Deploying atmospheric water generator unit at Tucson Sector Alpha";
         bytes32 messageHash = keccak256(abi.encodePacked(roomieRobot, address(rewardToken), member1, 500 * 10**18, nonce, missionLog));
-        bytes memory validSig = abi.encodePacked(messageHash, bytes32(uint256(1))); // Mock PQC signature length >= 64
+        bytes memory validSig = abi.encodePacked(messageHash, bytes32(uint256(1)));
 
         // Unauthorized caller trying to impersonate robot execution
         vm.prank(attacker);
@@ -133,10 +134,10 @@ contract BeeHabitatDAOAdvancedTest is Test {
         dao.recordHoneyHarvestWithPQC(2500, locationTag, harvestNonce, harvestSig);
         
         assertEq(dao.totalHoneyHarvestedGrams(), 2500);
-        (uint256 hId, uint256 weight, , string memory tag, bool ecologicalOnly) = dao.honeyHarvests(1);
+        (uint256 hId, uint256 weight, , , bool ecologicalOnly) = dao.honeyHarvests(1);
         assertEq(hId, 1);
         assertEq(weight, 2500);
-        assertTrue(ecologicalOnly); // Hardcoded enforcement: Harvested honey can never be used for profit
+        assertTrue(ecologicalOnly);
 
         // 7. Bee Flourishing Target & Mission Lock Enforcement
         uint256 targetNonce = dao.robotExecutionNonce();
