@@ -33,13 +33,13 @@ contract BeeHabitatDAO {
         uint256 weightGrams;
         uint256 timestamp;
         string locationTag;
-        bool distributedOrSold;
+        bool distributedForEcologicalUseOnly;
     }
 
     address public constant MASTER_CONTROLLER_WALLET = 0xBe53702c6f57aF155410f883f38f92414d39E3d5;
     IBindingCurveToken public immutable obsToken;
     
-    string public constant DAO_MISSION = "Autonomous robotic agents must actively deploy off-grid solar-powered atmospheric water generators and smart beehive modules, maintain habitat humidity and flora growth, harvest surplus honey securely, and enforce continuous on-chain validation until the bee flourishing index reaches target capacity, at which point the mission automatically locks as complete.";
+    string public constant DAO_MISSION = "Autonomous robotic agents must actively deploy off-grid solar-powered atmospheric water generators and smart beehive modules, maintain habitat humidity and flora growth, harvest surplus honey securely, and enforce continuous on-chain validation until the bee flourishing index reaches target capacity. HARVESTED HONEY CAN NEVER BE USED FOR PROFIT; it is strictly dedicated to bee sustenance, ecological support, and non-commercial DAO member distribution.";
     
     uint256 public constant FUNDING_GOAL_DAI = 5_000_000_000 * 10**18;
     uint256 public constant MONTHLY_LP_GRANT = 100 * 10**18;
@@ -242,7 +242,7 @@ contract BeeHabitatDAO {
             weightGrams: weightGrams,
             timestamp: block.timestamp,
             locationTag: locationTag,
-            distributedOrSold: false
+            distributedForEcologicalUseOnly: true
         });
 
         totalHoneyHarvestedGrams += weightGrams;
