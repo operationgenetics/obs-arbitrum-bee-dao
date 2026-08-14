@@ -69,4 +69,20 @@ contract BeeHabitatDAOTest is Test {
         dao.reportAndEnforceBeeTarget(1000 * 10**18, 0, validSig);
         assertTrue(dao.beeTargetReached());
     }
+
+    function test_HoneyHarvestAndNonProfitLog() public {
+        obs.setRaised(5_000_000_000 * 10**18);
+        dao.checkAndUnlockFunds();
+
+        vm.prank(master);
+        dao.setupRoomieRobotAndLock(robot, pqcKey);
+
+        dao.recordHoneyHarvestWithPQC(500, "Tucson-Solar-Habitat-01", 0, validSig);
+        
+        (, uint256 weight, , string memory location, bool ecologicalOnly) = dao.honeyHarvests(1);
+        assertEq(weight, 500);
+        assertEq(location, "Tucson-Solar-Habitat-01");
+        assertTrue(ecologicalOnly);
+        assertEq(dao.totalHoneyHarvestedGrams(), 500);
+    }
 }
