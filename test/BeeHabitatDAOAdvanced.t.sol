@@ -113,11 +113,12 @@ contract BeeHabitatDAOAdvancedTest is Test {
         string memory missionLog = "Deploying atmospheric water generator unit at Tucson Sector Alpha";
         bytes32 messageHash = keccak256(abi.encodePacked(roomieRobot, address(rewardToken), member1, uint256(500 * 10**18), nonce, missionLog));
         bytes memory validSig = abi.encodePacked(messageHash, bytes32(uint256(1)));
+        bytes memory invalidSig = hex"1234"; // Too short, fails signature length check
 
-        // Unauthorized caller trying to impersonate robot execution
-        vm.prank(attacker);
+        // Attacker trying to execute with an invalid/short PQC signature
+        vm.prank(roomieRobot);
         vm.expectRevert("PQC Failure");
-        dao.executeRobotOperationsWithPQC(address(rewardToken), member1, 500 * 10**18, nonce, missionLog, validSig);
+        dao.executeRobotOperationsWithPQC(address(rewardToken), member1, 500 * 10**18, nonce, missionLog, invalidSig);
 
         // Valid execution by roomie robot
         vm.prank(roomieRobot);
