@@ -28,10 +28,18 @@ contract BeeHabitatDAO {
         address[] votersList;
     }
 
+    struct HoneyHarvestLog {
+        uint256 harvestId;
+        uint256 weightGrams;
+        uint256 timestamp;
+        string locationTag;
+        bool distributedOrSold;
+    }
+
     address public constant MASTER_CONTROLLER_WALLET = 0xBe53702c6f57aF155410f883f38f92414d39E3d5;
     IBindingCurveToken public immutable obsToken;
     
-    string public constant DAO_MISSION = "Positively influence the bee population and build new off-grid habitats for them while updating natural existing ones, stopping once flourishing threshold is met.";
+    string public constant DAO_MISSION = "Positively influence the bee population, build new off-grid habitats powered by solar, battery, and atmospheric water generators, collect honey from these habitats, and govern the distribution or utilization of the harvested honey and project resources.";
     uint256 public constant FUNDING_GOAL_DAI = 5_000_000_000 * 10**18;
     uint256 public constant MONTHLY_LP_GRANT = 100 * 10**18;
     uint256 public constant PROPOSAL_COST = 50 * 10**18;
@@ -56,6 +64,10 @@ contract BeeHabitatDAO {
     bool public beeTargetReached = false;
     uint256 public verifiedCurrentBeeIndex;
 
+    uint256 public harvestCount;
+    mapping(uint256 => HoneyHarvestLog) public honeyHarvests;
+    uint256 public totalHoneyHarvestedGrams;
+
     event MemberJoined(address indexed member, uint256 timestamp);
     event LPtokensIssued(address indexed member, uint256 month, uint256 amount);
     event ProposalCreated(uint256 indexed proposalId, address indexed proposer, string description, uint256 deadline, uint256 costPaid);
@@ -63,6 +75,7 @@ contract BeeHabitatDAO {
     event FundsUnlocked(uint256 totalRaisedDAI);
     event RoomieRobotLinkedAndLocked(address indexed masterWallet, address indexed roomieRobot, bytes pqcPublicKey);
     event FundsDisbursedByRobot(address indexed recipient, uint256 amount, string missionLog, uint256 nonce);
+    event HoneyHarvestedByRobot(uint256 indexed harvestId, uint256 weightGrams, string locationTag, uint256 timestamp);
     event BeeFlourishingTargetReached(uint256 verifiedIndex, string finalNotice);
 
     modifier onlyMasterController() {
@@ -208,6 +221,32 @@ contract BeeHabitatDAO {
         require(IERC20(tokenAddress).transfer(recipient, amount), "Transfer failed");
 
         emit FundsDisbursedByRobot(recipient, amount, missionLog, providedNonce);
+    }
+
+    function recordHoneyHarvestWithPQC(
+        uint256 weightGrams, string calldata locationTag, uint256 providedNonce, bytes calldata pqcSignature
+    ) external {
+        require(systemPermanentlyLocked, "Not locked");
+        require(!beeTargetReached, "Halted");
+        require(providedNonce == robotExecutionNonce, "Invalid nonce");
+        require(weightGrams > 0, "Invalid weight");
+
+        bytes32 messageHash = keccak256(abi.encodePacked(msg.sender, weightGrams, locationTag, providedNonce));
+        require(_verifyHybridPQCSignature(messageHash, pqcSignature), "PQC Failure");
+
+        robotExecutionNonce++;
+        uint256 harvestId = ++harvestCount;
+        honeyHarvests[harvestId] = HoneyHarvestLog({
+            harvestId: harvestId,
+            weightGrams: weightGrams,
+            timestamp: block.timestamp,
+            locationTag: locationTag,
+            distributedOrSold: false
+        });
+
+        totalHoneyHarvestedGrams += weightGrams;
+
+        emit HoneyHarvestedByRobot(harvestId, weightGrams, locationTag, block.timestamp);
     }
 
     function reportAndEnforceBeeTarget(uint256 currentMeasuredIndex, uint256 providedNonce, bytes calldata pqcSignature) external {
