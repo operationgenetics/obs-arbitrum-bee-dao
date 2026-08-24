@@ -1,309 +1,202 @@
-// SPDX-License-Identifier: AGPLv3-3.0
-pragma solidity ^0.8.24;
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
 
-interface IBindingCurveToken {
-    function totalRaisedDAI() external view returns (uint256);
-    function transfer(address recipient, uint256 amount) external returns (bool);
-    function balanceOf(address account) external view returns (uint256);
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+interface IObscuraToken is IERC20 {
+    function getCostForTokens(uint256 tokenAmount) external view returns (uint256);
 }
 
-contract BeeHabitatDAO {
-    struct Member {
-        bool joined;
-        bool active;
-        uint256 lastClaimMonth;
-        uint256 joinTimestamp;
-    }
+contract BeeHabitatDAO is ReentrancyGuard {
+    address public constant OBS_TOKEN = 0x2D8760e2877148d239a54952A458710553B2B54b;
+    address public constant ADMIN_ORCHESTRATOR = 0xaF570ce3b32D765b1236635B0f541a7487A1fB8e;
+    uint256 public constant BONDING_CURVE_DAI_UNLOCK_TARGET = 5_000_000_000 * 1e18;
 
-    struct Proposal {
+    string public constant HABITAT_FOCUS_ZONE = "Nationwide United States Off-Grid Indoor & Regional Pollinator Corridors";
+    uint256 public constant MIN_FLOWERING_ACRES_TARGET = 20;
+    uint256 public constant OPTIMAL_BEE_INDEX_CAP = 500_000; 
+
+    uint256 public constant MONTHLY_LP_ISSUANCE = 100 * 1e18;
+    uint256 public constant PROPOSAL_THRESHOLD = 50 * 1e18;
+    uint256 public constant VOTING_PERIOD_DURATION = 30 days;
+    uint256 public constant MILESTONE_GATING_INTERVAL = 60 days;
+
+    bytes32 public roomieRobotPqcPublicKeyHash;
+    bool public roomieRobotLocked;
+    bool public canUpdateRobotConfig = true;
+
+    uint256 public totalObsVaultBalance;
+    bool public vaultUnlocked;
+
+    struct OffGridHabitatProposal {
         uint256 id;
         address proposer;
         string description;
+        uint256 targetAcresForBees;
+        uint256 proposedBeePopulationIndex;
+        bool solarAndBatteryEquipped;
+        bool atmosphericWaterGenEquipped;
         uint256 forVotes;
         uint256 againstVotes;
-        uint256 deadline;
-        uint256 costPaid;
+        uint256 startTime;
+        uint256 endTime;
         bool executed;
-        address[] votersList;
+        bool canceled;
+        mapping(address => bool) hasVoted;
     }
 
-    struct HoneyHarvestLog {
-        uint256 harvestId;
-        uint256 weightGrams;
-        uint256 timestamp;
-        string locationTag;
-        bool distributedForEcologicalUseOnly;
+    struct LpTokenLedger {
+        uint256 balance;
+        uint256 expirationMonth;
     }
 
-    address public constant MASTER_CONTROLLER_WALLET = 0xaF570ce3b32D765b1236635B0f541a7487A1fB8e;
-    address public constant OBS_TOKEN_ADDRESS = 0x2D8760e2877148d239a54952A458710553B2B54b;
-
-    IBindingCurveToken public immutable obsToken;
-    
-    string public constant DAO_MISSION = "Autonomous robotic agents must actively deploy off-grid solar-powered atmospheric water generators and smart beehive modules, maintain habitat humidity and flora growth, harvest surplus honey securely, and enforce continuous on-chain validation until the bee flourishing index reaches target capacity. HARVESTED HONEY CAN NEVER BE USED FOR PROFIT; it is strictly dedicated to bee sustenance, ecological support, and non-commercial DAO member distribution.";
-    
-    uint256 public constant FUNDING_GOAL_DAI = 5_000_000_000 * 10**18;
-    uint256 public constant MONTHLY_LP_GRANT = 100 * 10**18;
-    uint256 public constant PROPOSAL_COST = 50 * 10**18;
-    uint256 public constant MAX_MEMBERS = 20_000;
-    
-    string public constant ipfsLogoCID = "bafybeibwefcd3zidp4echnjpjd4xtepif7fivxpp3dsvtlxvxoum5z7jqu";
-
-    mapping(address => Member) public members;
-    address[] public memberList;
-    uint256 public activeMemberCount;
-
-    mapping(address => mapping(uint256 => uint256)) public monthlyLPBal; 
-    mapping(address => mapping(uint256 => bool)) public monthlyClaimed;   
-
+    mapping(address => LpTokenLedger) public monthlyLpBalances;
+    mapping(uint256 => OffGridHabitatProposal) public proposals;
     uint256 public proposalCount;
-    mapping(uint256 => Proposal) public proposals;
-    mapping(uint256 => mapping(address => bool)) public hasVotedOnProposal;
 
-    bool public fundsUnlocked;
-    address public connectedRoomieRobotAddress;
-    bytes public roomiePqcPublicKey; 
-    bytes public daoPqcPublicKey;
+    mapping(uint256 => uint256) public projectMilestoneTimeouts;
+    mapping(uint256 => bool) public projectFundReleased;
 
-    bool public robotConfigUpdatable = true;
-    bool public systemPermanentlyLocked = false;
-    uint256 public robotExecutionNonce; 
-    uint256 public daoGovernanceNonce;
+    event RoomieRobotConfigured(bytes32 pqcPublicKeyHash);
+    event RobotConfigRevoked();
+    event OffGridBeeHabitatProposalCreated(
+        uint256 indexed proposalId, 
+        address indexed proposer, 
+        string description, 
+        uint256 targetAcres, 
+        uint256 proposedBeePopulationIndex,
+        bool solarPowered,
+        bool awgWaterPowered
+    );
+    event Voted(uint256 indexed proposalId, address indexed voter, uint256 weight, bool support);
+    event VaultUnlockedByBondingCurve(uint256 daiReserves);
+    event MilestoneAuthorizedByRobot(uint256 indexed projectId, uint256 timestamp);
 
-    uint256 public constant BEE_FLOURISHING_TARGET_INDEX = 1000 * 10**18; 
-    bool public beeTargetReached = false;
-    uint256 public verifiedCurrentBeeIndex;
-
-    uint256 public harvestCount;
-    mapping(uint256 => HoneyHarvestLog) public honeyHarvests;
-    uint256 totalHoneyHarvestedGrams;
-
-    event MemberJoined(address indexed member, uint256 timestamp);
-    event MemberBurned(address indexed member, uint256 timestamp);
-    event LPtokensIssued(address indexed member, uint256 month, uint256 amount);
-    event ProposalCreated(uint256 indexed proposalId, address indexed proposer, string description, uint256 deadline, uint256 costPaid);
-    event Voted(uint256 indexed proposalId, address indexed voter, bool support, uint256 weight);
-    event FundsUnlocked(uint256 totalRaisedDAI);
-    event RoomieRobotLinkedAndUpdated(address indexed masterWallet, address indexed roomieRobot, bytes pqcPublicKey);
-    event RobotConfigUpdatesRevoked(address indexed masterWallet, uint256 timestamp);
-    event DAOActionExecutedWithPQC(uint256 indexed nonce, string actionDescription);
-    event FundsDisbursedByRobot(address indexed recipient, uint256 amount, string missionLog, uint256 nonce);
-    event HoneyHarvestedByRobot(uint256 indexed harvestId, uint256 weightGrams, string locationTag, uint256 timestamp);
-    event BeeFlourishingTargetReached(uint256 verifiedIndex, string finalNotice);
-
-    modifier onlyMasterController() {
-        require(msg.sender == MASTER_CONTROLLER_WALLET, "Unauthorized: Master Controller only");
+    modifier onlyAdminOrRobot() {
+        require(msg.sender == ADMIN_ORCHESTRATOR, "Unauthorized: Must match hardware orchestrator");
         _;
     }
 
     constructor() {
-        obsToken = IBindingCurveToken(OBS_TOKEN_ADDRESS);
-        daoPqcPublicKey = hex"deadbeef"; 
+        roomieRobotLocked = false;
     }
 
-    function getVaultBalance() external view returns (uint256) {
-        return obsToken.balanceOf(address(this));
+    function setupRoomieRobotAndLock(bytes32 _pqcPublicKeyHash) external onlyAdminOrRobot {
+        require(canUpdateRobotConfig, "Robot configuration is permanently immutable");
+        roomieRobotPqcPublicKeyHash = _pqcPublicKeyHash;
+        roomieRobotLocked = true;
+        emit RoomieRobotConfigured(_pqcPublicKeyHash);
     }
 
-    function joinDAO() external {
-        require(!members[msg.sender].joined, "Already a member");
-        require(activeMemberCount < MAX_MEMBERS, "Max 20k members reached");
+    function revokeAndUpdateImmutability() external onlyAdminOrRobot {
+        require(canUpdateRobotConfig, "Already immutable");
+        canUpdateRobotConfig = false;
+        emit RobotConfigRevoked();
+    }
 
-        members[msg.sender] = Member({
-            joined: true,
-            active: true,
-            lastClaimMonth: _getCurrentMonth(),
-            joinTimestamp: block.timestamp
+    function issueMonthlyLpTokens(address recipient, uint256 amount) external onlyAdminOrRobot {
+        require(amount <= MONTHLY_LP_ISSUANCE, "Exceeds monthly issuance limit");
+        uint256 currentMonth = block.timestamp / 30 days;
+        
+        monthlyLpBalances[recipient] = LpTokenLedger({
+            balance: amount,
+            expirationMonth: currentMonth
         });
-
-        memberList.push(msg.sender);
-        activeMemberCount++;
-
-        emit MemberJoined(msg.sender, block.timestamp);
-        _claimMonthlyLP(msg.sender);
-    }
-
-    function burnMembership() external {
-        require(members[msg.sender].joined && members[msg.sender].active, "Not an active member");
-        members[msg.sender].active = false;
-        if (activeMemberCount > 0) {
-            activeMemberCount--;
-        }
-        emit MemberBurned(msg.sender, block.timestamp);
-    }
-
-    function _getCurrentMonth() public view returns (uint256) {
-        uint256 secondsPerMonth = 30 days; 
-        return (block.timestamp / secondsPerMonth) * secondsPerMonth;
-    }
-
-    function claimMonthlyLP() external {
-        require(members[msg.sender].joined && members[msg.sender].active, "Not an active DAO member");
-        _claimMonthlyLP(msg.sender);
-    }
-
-    function _claimMonthlyLP(address member) internal {
-        uint256 currentMonth = _getCurrentMonth();
-        require(!monthlyClaimed[member][currentMonth], "Already claimed for this month");
-        monthlyClaimed[member][currentMonth] = true;
-        monthlyLPBal[member][currentMonth] = MONTHLY_LP_GRANT;
-        emit LPtokensIssued(member, currentMonth, MONTHLY_LP_GRANT);
     }
 
     function getVotingPower(address account) public view returns (uint256) {
-        uint256 currentMonth = _getCurrentMonth();
-        return monthlyLPBal[account][currentMonth];
+        LpTokenLedger memory ledger = monthlyLpBalances[account];
+        uint256 currentMonth = block.timestamp / 30 days;
+        
+        if (ledger.expirationMonth < currentMonth) {
+            return 0;
+        }
+        return ledger.balance;
     }
 
-    function createProposal(string memory description, uint256 durationDays) external {
-        require(!beeTargetReached, "Mission Accomplished: Bee flourishing target reached and locked.");
-        require(members[msg.sender].joined && members[msg.sender].active, "Only active members");
-        
-        uint256 currentMonth = _getCurrentMonth();
-        uint256 currentBalance = monthlyLPBal[msg.sender][currentMonth];
-        require(currentBalance >= PROPOSAL_COST, "Insufficient active monthly LP tokens");
-        
-        monthlyLPBal[msg.sender][currentMonth] = currentBalance - PROPOSAL_COST;
+    function createOffGridBeeHabitatProposal(
+        string calldata description, 
+        uint256 targetAcresForBees,
+        uint256 proposedBeePopulationIndex,
+        bool solarAndBatteryEquipped,
+        bool atmosphericWaterGenEquipped
+    ) external returns (uint256) {
+        require(getVotingPower(msg.sender) >= PROPOSAL_THRESHOLD, "Insufficient unexpired LP tokens (50 required)");
+        require(targetAcresForBees >= MIN_FLOWERING_ACRES_TARGET, "Must meet minimum bee forage acreage mandate");
+        require(proposedBeePopulationIndex <= OPTIMAL_BEE_INDEX_CAP, "Exceeds optimal safe carrying capacity index cap");
+        require(solarAndBatteryEquipped, "Off-grid habitats must feature solar and battery storage");
+        require(atmosphericWaterGenEquipped, "Off-grid habitats must feature atmospheric water generation");
 
         uint256 proposalId = ++proposalCount;
-        Proposal storage p = proposals[proposalId];
-        p.id = proposalId;
-        p.proposer = msg.sender;
-        p.description = description;
-        p.deadline = block.timestamp + (durationDays * 1 days);
-        p.costPaid = PROPOSAL_COST;
-        p.executed = false;
+        OffGridHabitatProposal storage prop = proposals[proposalId];
+        prop.id = proposalId;
+        prop.proposer = msg.sender;
+        prop.description = description;
+        prop.targetAcresForBees = targetAcresForBees;
+        prop.proposedBeePopulationIndex = proposedBeePopulationIndex;
+        prop.solarAndBatteryEquipped = solarAndBatteryEquipped;
+        prop.atmosphericWaterGenEquipped = atmosphericWaterGenEquipped;
+        prop.startTime = block.timestamp;
+        prop.endTime = block.timestamp + VOTING_PERIOD_DURATION;
 
-        emit ProposalCreated(proposalId, msg.sender, description, p.deadline, PROPOSAL_COST);
+        emit OffGridBeeHabitatProposalCreated(
+            proposalId, 
+            msg.sender, 
+            description, 
+            targetAcresForBees, 
+            proposedBeePopulationIndex, 
+            solarAndBatteryEquipped, 
+            atmosphericWaterGenEquipped
+        );
+        return proposalId;
     }
 
     function vote(uint256 proposalId, bool support) external {
-        require(!beeTargetReached, "Mission Accomplished: Bee flourishing target reached and locked.");
-        Proposal storage p = proposals[proposalId];
-        require(block.timestamp < p.deadline, "Ended");
-        require(!hasVotedOnProposal[proposalId][msg.sender], "Already voted");
-        
+        OffGridHabitatProposal storage prop = proposals[proposalId];
+        require(block.timestamp >= prop.startTime && block.timestamp <= prop.endTime, "Voting inactive");
+        require(!prop.hasVoted[msg.sender], "Already voted");
+
         uint256 weight = getVotingPower(msg.sender);
-        require(weight > 0, "No weight");
+        require(weight > 0, "No active unexpired LP voting power");
 
-        uint256 currentMonth = _getCurrentMonth();
-        monthlyLPBal[msg.sender][currentMonth] = 0; 
-
-        hasVotedOnProposal[proposalId][msg.sender] = true;
-        p.votersList.push(msg.sender);
-
+        prop.hasVoted[msg.sender] = true;
         if (support) {
-            p.forVotes += weight;
+            prop.forVotes += weight;
         } else {
-            p.againstVotes += weight;
+            prop.againstVotes += weight;
         }
 
-        emit Voted(proposalId, msg.sender, support, weight);
+        emit Voted(proposalId, msg.sender, weight, support);
     }
 
-    function checkAndUnlockFunds() external returns (bool) {
-        if (fundsUnlocked) return true;
-        uint256 raisedDAI = obsToken.totalRaisedDAI();
-        if (raisedDAI >= FUNDING_GOAL_DAI) {
-            fundsUnlocked = true;
-            emit FundsUnlocked(raisedDAI);
-            return true;
-        }
-        return false;
-    }
-
-    function updateRoomieRobotConfig(address roomieRobotAddress, bytes calldata _pqcPublicKey) external onlyMasterController {
-        require(robotConfigUpdatable, "Robot configuration updates permanently locked");
-        require(roomieRobotAddress != address(0), "Invalid robot");
-        require(_pqcPublicKey.length > 0, "Invalid PQC key");
-
-        connectedRoomieRobotAddress = roomieRobotAddress;
-        roomiePqcPublicKey = _pqcPublicKey;
-        systemPermanentlyLocked = true;
-
-        emit RoomieRobotLinkedAndUpdated(MASTER_CONTROLLER_WALLET, roomieRobotAddress, _pqcPublicKey);
-    }
-
-    function revokeRobotConfigUpdates() external onlyMasterController {
-        require(robotConfigUpdatable, "Already revoked");
-        robotConfigUpdatable = false;
-        emit RobotConfigUpdatesRevoked(MASTER_CONTROLLER_WALLET, block.timestamp);
-    }
-
-    function _verifyHybridPQCSignature(bytes32 messageHash, bytes calldata pqcSignature, bytes memory publicKey) internal view returns (bool) {
-        if (pqcSignature.length < 64) return false;
-        bytes32 computedKeyValidation = keccak256(publicKey);
-        return computedKeyValidation != bytes32(0) && messageHash != bytes32(0);
-    }
-
-    function executePqcSecuredDaoAction(bytes calldata actionData, uint256 providedNonce, bytes calldata pqcSignature) external {
-        require(providedNonce == daoGovernanceNonce, "Invalid DAO nonce");
-        bytes32 messageHash = keccak256(abi.encodePacked(actionData, providedNonce));
-        require(_verifyHybridPQCSignature(messageHash, pqcSignature, daoPqcPublicKey), "DAO PQC Failure");
+    function checkAndUnlockVault(uint256 currentDaiReserves) external {
+        require(!vaultUnlocked, "Vault already unlocked");
+        require(currentDaiReserves >= BONDING_CURVE_DAI_UNLOCK_TARGET, "Target of 5 Billion DAI not reached");
         
-        daoGovernanceNonce++;
-        emit DAOActionExecutedWithPQC(providedNonce, "Action executed securely via hybrid PQC");
+        vaultUnlocked = true;
+        emit VaultUnlockedByBondingCurve(currentDaiReserves);
     }
 
-    function executeRobotOperationsWithPQC(
-        address recipient, uint256 amount, 
-        uint256 providedNonce, string calldata missionLog, bytes calldata pqcSignature
-    ) external {
-        require(fundsUnlocked, "Treasury vault funds not unlocked via 5B DAI bonding curve");
-        require(systemPermanentlyLocked, "System not locked");
-        require(!beeTargetReached, "Mission Accomplished: Operations halted.");
-        require(providedNonce == robotExecutionNonce, "Invalid nonce");
-        require(recipient != address(0), "Invalid recipient");
-
-        bytes32 messageHash = keccak256(abi.encodePacked(msg.sender, recipient, amount, providedNonce, missionLog));
-        require(_verifyHybridPQCSignature(messageHash, pqcSignature, roomiePqcPublicKey), "PQC Failure");
-
-        robotExecutionNonce++;
-        require(obsToken.transfer(recipient, amount), "Transfer failed");
-
-        emit FundsDisbursedByRobot(recipient, amount, missionLog, providedNonce);
-    }
-
-    function recordHoneyHarvestWithPQC(
-        uint256 weightGrams, string calldata locationTag, uint256 providedNonce, bytes calldata pqcSignature
-    ) external {
-        require(systemPermanentlyLocked, "System not locked");
-        require(!beeTargetReached, "Mission Accomplished: Harvest halted.");
-        require(providedNonce == robotExecutionNonce, "Invalid nonce");
-        require(weightGrams > 0, "Invalid weight");
-
-        bytes32 messageHash = keccak256(abi.encodePacked(msg.sender, weightGrams, locationTag, providedNonce));
-        require(_verifyHybridPQCSignature(messageHash, pqcSignature, roomiePqcPublicKey), "PQC Failure");
-
-        robotExecutionNonce++;
-        uint256 harvestId = ++harvestCount;
-        honeyHarvests[harvestId] = HoneyHarvestLog({
-            harvestId: harvestId,
-            weightGrams: weightGrams,
-            timestamp: block.timestamp,
-            locationTag: locationTag,
-            distributedForEcologicalUseOnly: true
-        });
-
-        totalHoneyHarvestedGrams += weightGrams;
-
-        emit HoneyHarvestedByRobot(harvestId, weightGrams, locationTag, block.timestamp);
-    }
-
-    function reportAndEnforceBeeTarget(uint256 currentMeasuredIndex, uint256 providedNonce, bytes calldata pqcSignature) external {
-        require(systemPermanentlyLocked, "System not locked");
-        require(!beeTargetReached, "Already reached");
-        require(providedNonce == robotExecutionNonce, "Invalid nonce");
-
-        bytes32 messageHash = keccak256(abi.encodePacked(msg.sender, currentMeasuredIndex, providedNonce));
-        require(_verifyHybridPQCSignature(messageHash, pqcSignature, roomiePqcPublicKey), "PQC Failure");
-
-        robotExecutionNonce++;
-        verifiedCurrentBeeIndex = currentMeasuredIndex;
-
-        if (currentMeasuredIndex >= BEE_FLOURISHING_TARGET_INDEX) {
-            beeTargetReached = true;
-            emit BeeFlourishingTargetReached(currentMeasuredIndex, "MISSION_SUCCESS_BEE_POPULATION_FLOURISHING");
+    function robotAuthorizeProjectMilestone(uint256 projectId, bytes calldata robotPqcSignature) external onlyAdminOrRobot {
+        require(roomieRobotLocked, "Roomie robot not locked/configured");
+        
+        uint256 lastMilestoneTime = projectMilestoneTimeouts[projectId];
+        if (lastMilestoneTime > 0) {
+            require(
+                block.timestamp >= lastMilestoneTime + MILESTONE_GATING_INTERVAL,
+                "Milestone locked: Bi-monthly cycle (1 time every 2 months) not reached"
+            );
         }
+        require(robotPqcSignature.length > 0, "Invalid biometric PQC MCU signature");
+
+        projectMilestoneTimeouts[projectId] = block.timestamp;
+        projectFundReleased[projectId] = true;
+        emit MilestoneAuthorizedByRobot(projectId, block.timestamp);
+    }
+
+    function depositToVault(uint256 amount) external nonReentrant {
+        require(IERC20(OBS_TOKEN).transferFrom(msg.sender, address(this), amount), "Transfer failed");
+        totalObsVaultBalance += amount;
     }
 }

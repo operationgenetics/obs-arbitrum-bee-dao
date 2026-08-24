@@ -1,0 +1,29 @@
+{
+  "name": "obs-arbitrum-bee-dao",
+  "version": "1.0.0",
+  "description": "Secure vault and DAO framework designed to lock funds until a **5 billion DAI bonding curve threshold** is achieved, after which operational control transfers exclusively to humanoid robots verified via a hybrid quantum-resistant chipset and multi-modal biometrics (facial, voice, and fingerprint templates).",
+  "main": "deploy.js",
+  "directories": {
+    "lib": "lib",
+    "test": "test"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/operationgenetics/obs-arbitrum-bee-dao.git"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/operationgenetics/obs-arbitrum-bee-dao/issues"
+  },
+  "homepage": "https://github.com/operationgenetics/obs-arbitrum-bee-dao#readme",
+  "dependencies": {
+    "@walletconnect/ethereum-provider": "^2.23.10",
+    "@walletconnect/universal-provider": "^2.23.10",
+    "ethers": "^6.17.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
