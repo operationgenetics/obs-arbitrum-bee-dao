@@ -3,6 +3,7 @@ cache
 broadcast
 docs
 deployment.json
+.walletconnect-uri.txt
 *.bin
 *.sig
 attestation.json
