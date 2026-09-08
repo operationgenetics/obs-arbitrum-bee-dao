@@ -1,1 +1,0 @@
-{"version":1,"failures":[{"contract":"test/BeeHabitatDAOFullAudit.t.sol:BeeHabitatDAOFullAuditTest","test":"testFullSecurityAndOperationalAudit"}]}

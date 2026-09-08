@@ -1,380 +1,454 @@
-// SPDX-License-Identifier: AGPLv3-3.0
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "forge-std/Test.sol";
-import "../contracts/BeeHabitatDAO.sol";
+import {BeeHabitatHarness} from "./Harness.sol";
+import {BeeHabitatDAO} from "../contracts/BeeHabitatDAO.sol";
 
-contract BeeHabitatDAOFullAuditTest is Test {
-    BeeHabitatDAO public dao;
+/// @notice End-to-end audit: vault-lock invariants, quorum, timeouts, completion, immutability.
+contract BeeHabitatDAOFullAuditTest is BeeHabitatHarness {
+    /* ============ INVARIANT: nothing leaves the vault before 5B DAI ============ */
 
-    address adminOrchestrator = 0xaF570ce3b32D765b1236635B0f541a7487A1fB8e;
-    address daoMember = address(0x111);
-    address recipient = address(0x222);
-
-    bytes32 constant ROBOT_PQC_KEY = keccak256("ROOMIE_ROBOT_PQC_DILITHIUM_KEY");
-    bytes constant VALID_PQC_SIGNATURE = hex"1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-
-    function setUp() public {
-        dao = new BeeHabitatDAO();
-    }
-
-    function testFullSecurityAndOperationalAudit() public {
-        // --- 1. VERIFY IMMUTABLES & CONSTANTS ---
-        assertEq(dao.ADMIN_ORCHESTRATOR(), adminOrchestrator);
-        assertEq(dao.OBS_TOKEN(), 0x2D8760e2877148d239a54952A458710553B2B54b);
-        assertEq(dao.BONDING_CURVE_DAI_UNLOCK_TARGET(), 5_000_000_000 * 1e18);
-        assertEq(dao.MONTHLY_LP_ISSUANCE(), 100 * 1e18);
-        assertEq(dao.PROPOSAL_THRESHOLD(), 50 * 1e18);
-        assertEq(dao.VOTING_PERIOD_DURATION(), 30 days);
-        assertEq(dao.MILESTONE_GATING_INTERVAL(), 60 days);
-        assertTrue(bytes(dao.HABITAT_FOCUS_ZONE()).length > 0);
-        assertEq(dao.MIN_FLOWERING_ACRES_TARGET(), 20);
-        assertEq(dao.OPTIMAL_BEE_INDEX_CAP(), 500_000);
-
-        // --- 2. TEST MEMBERSHIP & MONTHLY LP EXPIRY SYSTEM ---
-        vm.prank(adminOrchestrator);
-        dao.issueMonthlyLpTokens(daoMember, 100 * 1e18);
-        assertEq(dao.getVotingPower(daoMember), 100 * 1e18);
-
-        // LP expires at month end
-        skip(31 days);
-        assertEq(dao.getVotingPower(daoMember), 0);
-
-        // Re-issue for next month
-        vm.prank(adminOrchestrator);
-        dao.issueMonthlyLpTokens(daoMember, 100 * 1e18);
-        assertEq(dao.getVotingPower(daoMember), 100 * 1e18);
-
-        // --- 3. TEST BONDING CURVE GATE (5 Billion DAI) ---
+    function test_NoObsCanLeaveTheVaultBeforeTheBondingCurveTarget() public {
+        _commissionRobot();
+        _fundVault(VAULT_SEED);
         assertFalse(dao.isVaultUnlocked());
 
-        vm.expectRevert("Target of 5 Billion DAI not reached");
-        dao.checkAndUnlockVault(4_999_999_999 * 1e18);
+        // Proposals may pass, but they cannot be executed into a funded project.
+        _issueLp(daoMember, 100 * 1e18);
+        vm.prank(daoMember);
+        uint256 propId = dao.createOffGridBeeHabitatProposal(
+            "premature", 25, 100, 1_000 * 1e18, habitatOperator, true, true, true, true, true
+        );
+        vm.prank(daoMember);
+        dao.vote(propId, true);
+        vm.warp(block.timestamp + 31 days);
 
-        dao.checkAndUnlockVault(5_000_000_000 * 1e18);
-        assertTrue(dao.isVaultUnlocked());
+        vm.expectRevert("Vault not unlocked: 5B DAI threshold not reached");
+        dao.executeProposal(propId);
 
-        // --- 4. TEST ROBOT PQC HARDWARE LOCKDOWN LIFECYCLE ---
-        // Phase 1: Deploy without robot (already done in setUp)
-        assertFalse(dao.isRobotConfigured());
-        assertTrue(dao.isConfigUpdatable());
+        vm.prank(ADMIN);
+        vm.expectRevert("Vault not unlocked: 5B DAI threshold not reached");
+        dao.robotAuthorizeAndReleaseMilestone(
+            1, 1e18, _goodAttestation(), pqcPublicKey, _validPqcSignature(), new bytes(65), otsChain[OTS_LEN - 1]
+        );
 
-        // Phase 2: Setup robot after hardware received
-        vm.prank(adminOrchestrator);
-        dao.setupRoomieRobotAndLock(ROBOT_PQC_KEY);
-        assertTrue(dao.isRobotConfigured());
-        assertEq(dao.getRobotPqcPublicKeyHash(), ROBOT_PQC_KEY);
-        assertTrue(dao.isConfigUpdatable()); // Still updatable
+        // Every OBS is still in the vault.
+        assertEq(obs.balanceOf(address(dao)), VAULT_SEED);
+        assertEq(dao.totalObsReleased(), 0);
+    }
 
-        // Phase 3: Key rotation possible
-        bytes32 newKey = keccak256("ROTATED_KEY_V2");
-        vm.prank(adminOrchestrator);
-        dao.updateRobotPqcPublicKey(newKey);
-        assertEq(dao.getRobotPqcPublicKeyHash(), newKey);
+    function test_ContractExposesNoOwnerOrEscapeHatch() public {
+        _commissionRobot();
+        _fundVault(VAULT_SEED);
+        _unlockVault();
 
-        // Phase 4: Revoke update permission - permanent immutability
-        vm.prank(adminOrchestrator);
-        dao.revokeAndUpdateImmutability();
-        assertFalse(dao.isConfigUpdatable());
+        // There is no owner(), no transferOwnership, no pause, no upgrade, no rescue, no
+        // arbitrary-recipient withdrawal. The only outbound transfer is the milestone path.
+        (bool ok,) = address(dao).call(abi.encodeWithSignature("owner()"));
+        assertFalse(ok);
+        (ok,) = address(dao).call(abi.encodeWithSignature("transferOwnership(address)", unauthorizedUser));
+        assertFalse(ok);
+        (ok,) = address(dao).call(abi.encodeWithSignature("upgradeTo(address)", unauthorizedUser));
+        assertFalse(ok);
+        (ok,) = address(dao).call(abi.encodeWithSignature("withdrawProjectFunds(uint256,address,uint256)", 1, unauthorizedUser, 1));
+        assertFalse(ok);
+        (ok,) = address(dao).call(abi.encodeWithSignature("rescueTokens(address,uint256)", OBS_TOKEN, 1));
+        assertFalse(ok);
 
-        // After revocation, cannot update
-        vm.prank(adminOrchestrator);
-        vm.expectRevert("Robot configuration is permanently immutable");
-        dao.updateRobotPqcPublicKey(keccak256("ANOTHER_KEY"));
+        assertEq(obs.balanceOf(address(dao)), VAULT_SEED);
+    }
 
-        vm.prank(adminOrchestrator);
-        vm.expectRevert("Robot configuration is permanently immutable");
-        dao.setupRoomieRobotAndLock(keccak256("ANOTHER_KEY"));
+    /* ============================== QUORUM ================================ */
 
-        // --- 5. TEST ROBOT OPERATION & MILESTONE AUTHORIZATION ---
-        // Create and execute proposal to generate project
-        vm.prank(adminOrchestrator);
-        dao.issueMonthlyLpTokens(daoMember, 100 * 1e18);
+    function test_QuorumIsActuallyEnforced() public {
+        _commissionRobot();
+        _fundVault(VAULT_SEED);
+        _unlockVault();
+
+        // 10 members x 100 LP = 1000 LP live supply; quorum is 10% = 100 LP.
+        for (uint256 i = 0; i < 10; i++) {
+            _issueLp(address(uint160(0x1000 + i)), 100 * 1e18);
+        }
+        _issueLp(daoMember, 100 * 1e18); // proposer, 1100 LP total => quorum 110 LP
 
         vm.prank(daoMember);
         uint256 propId = dao.createOffGridBeeHabitatProposal(
-            "Tucson Off-Grid Bee Habitat",
-            40,
-            350_000,
-            true,
-            true,
-            true,
-            true,
-            true
+            "quorum test", 25, 100, 1_000 * 1e18, habitatOperator, true, true, true, true, true
         );
-
         vm.prank(daoMember);
-        dao.vote(propId, true);
+        dao.vote(propId, true); // 100 LP < 110 LP quorum
 
-        skip(31 days);
-
-        vm.prank(adminOrchestrator);
-        dao.executeProposal(propId, 10_000 * 1e18);
-
-        assertEq(dao.getProjectCount(), 1);
-
-        // Robot authorizes milestone with PQC signature
-        vm.prank(adminOrchestrator);
-        dao.robotAuthorizeProjectMilestone(1, VALID_PQC_SIGNATURE);
-
-        assertTrue(dao.getProjectFundsReleased(1));
-        assertEq(dao.getProjectLastMilestoneTime(1), block.timestamp);
-
-        // --- 6. TEST BI-MONTHLY AUTHORIZATION ENFORCEMENT ---
-        // Immediate re-authorization fails (funds already released for current milestone)
-        vm.expectRevert("Funds already released for current milestone");
-        vm.prank(adminOrchestrator);
-        dao.robotAuthorizeProjectMilestone(1, VALID_PQC_SIGNATURE);
-
-        // Wait 60 days
-        skip(60 days);
-
-        // Still fails - funds still released from first milestone
-        vm.expectRevert("Funds already released for current milestone");
-        vm.prank(adminOrchestrator);
-        dao.robotAuthorizeProjectMilestone(1, VALID_PQC_SIGNATURE);
-
-        // Wait 1 more day - still fails because funds still released
-        skip(1 days);
-
-        vm.expectRevert("Funds already released for current milestone");
-        vm.prank(adminOrchestrator);
-        dao.robotAuthorizeProjectMilestone(1, VALID_PQC_SIGNATURE);
-
-// --- 7. TEST PQC SIGNATURE VALIDATION ---
-        // Note: Previous successful authorization set fundsReleased = true
-        // So signature validation tests will hit "Funds already released" first for non-empty signatures
-        // Empty signature correctly fails at length check first
-        
-        // Short signature - fails because funds still released (length > 0 passes)
-        bytes memory shortSig = hex"1234";
-        vm.expectRevert("Funds already released for current milestone");
-        vm.prank(adminOrchestrator);
-        dao.robotAuthorizeProjectMilestone(1, shortSig);
-
-        // Empty signature - correctly fails at length check (length == 0)
-        vm.expectRevert("Invalid biometric PQC MCU signature");
-        vm.prank(adminOrchestrator);
-        dao.robotAuthorizeProjectMilestone(1, bytes(""));
-
-        // --- 8. TEST PROJECT TIMEOUT ENFORCEMENT ---
-        // Project not expired before deadline
-        dao.checkProjectTimeout(1);
-        assertFalse(dao.getProjectCompleted(1));
-
-        // Warp past deadline (365 days from project creation)
-        skip(366 days);
-
-        dao.checkProjectTimeout(1);
-        assertTrue(dao.getProjectCompleted(1));
-        assertEq(dao.getProjectFundingAmount(1), 0);
-
-        // --- 9. TEST VAULT CUSTODY ---
-        assertEq(dao.totalObsVaultBalance(), 0);
-        // depositToVault requires actual token, tested via integration
-
-        // --- 10. TEST MISSION ENFORCEMENT ---
-        // All mission criteria mandatory in proposal creation
-        vm.prank(adminOrchestrator);
-        dao.issueMonthlyLpTokens(daoMember, 100 * 1e18);
-
-        // Missing solar - fails
-        vm.prank(daoMember);
-        vm.expectRevert("Off-grid habitats must feature solar and battery storage");
-        dao.createOffGridBeeHabitatProposal("Test", 25, 450_000, false, true, true, true, true);
-
-        // Missing AWG - fails
-        vm.prank(daoMember);
-        vm.expectRevert("Off-grid habitats must feature atmospheric water generation");
-        dao.createOffGridBeeHabitatProposal("Test", 25, 450_000, true, false, true, true, true);
-
-        // Missing land - fails
-        vm.prank(daoMember);
-        vm.expectRevert("Must include land acquisition for permanent habitat");
-        dao.createOffGridBeeHabitatProposal("Test", 25, 450_000, true, true, false, true, true);
-
-        // Missing equipment - fails
-        vm.prank(daoMember);
-        vm.expectRevert("Must include equipment for maintenance operations");
-        dao.createOffGridBeeHabitatProposal("Test", 25, 450_000, true, true, true, false, true);
-
-        // Missing honey - fails
-        vm.prank(daoMember);
-        vm.expectRevert("Must include honey production and free distribution");
-        dao.createOffGridBeeHabitatProposal("Test", 25, 450_000, true, true, true, true, false);
-
-        // All present - succeeds
-        vm.prank(daoMember);
-        uint256 validPropId = dao.createOffGridBeeHabitatProposal(
-            "Complete Mission Proposal",
-            25,
-            450_000,
-            true,
-            true,
-            true,
-            true,
-            true
-        );
-        assertGt(validPropId, 0);
-
-        // --- 11. TEST UNAUTHORIZED ACCESS CONTROL ---
-        address attacker = makeAddr("attacker");
-
-        vm.prank(attacker);
-        vm.expectRevert("Unauthorized: Must match hardware orchestrator");
-        dao.setupRoomieRobotAndLock(ROBOT_PQC_KEY);
-
-        vm.prank(attacker);
-        vm.expectRevert("Unauthorized: Must match hardware orchestrator");
-        dao.revokeAndUpdateImmutability();
-
-        vm.prank(attacker);
-        vm.expectRevert("Unauthorized: Must match hardware orchestrator");
-        dao.issueMonthlyLpTokens(daoMember, 100 * 1e18);
-
-        vm.prank(attacker);
-        vm.expectRevert("Unauthorized: Must match hardware orchestrator");
-        dao.robotAuthorizeProjectMilestone(1, VALID_PQC_SIGNATURE);
-
-        // --- 12. TEST REENTRANCY PROTECTION ---
-        // withdrawProjectFunds uses nonReentrant modifier
-        // Verified by modifier presence
-
-        // --- 13. TEST WEIGHTED VOTING 1 LP = 1 VOTE ---
-        address voteTester = makeAddr("voteTester");
-        vm.prank(adminOrchestrator);
-        dao.issueMonthlyLpTokens(voteTester, 75 * 1e18);
-
-        vm.prank(voteTester);
-        uint256 propId2 = dao.createOffGridBeeHabitatProposal(
-            "Vote Weight Test",
-            25,
-            450_000,
-            true,
-            true,
-            true,
-            true,
-            true
-        );
-
-        vm.prank(voteTester);
-        dao.vote(propId2, true);
-
-        assertEq(dao.getProposalForVotes(propId2), 75 * 1e18);
-
-        // --- 14. TEST PROPOSAL THRESHOLD 50 LP ---
-        address lowLpMember = makeAddr("lowLpMember");
-        vm.prank(adminOrchestrator);
-        dao.issueMonthlyLpTokens(lowLpMember, 49 * 1e18);
-
-        vm.prank(lowLpMember);
-        vm.expectRevert("Insufficient unexpired LP tokens (50 required)");
-        dao.createOffGridBeeHabitatProposal(
-            "Should Fail",
-            25,
-            450_000,
-            true,
-            true,
-            true,
-            true,
-            true
-        );
-
-        // Exactly 50 works
-        vm.prank(adminOrchestrator);
-        dao.issueMonthlyLpTokens(lowLpMember, 1 * 1e18); // Now has 50
-        vm.prank(lowLpMember);
-        uint256 propId3 = dao.createOffGridBeeHabitatProposal(
-            "Should Pass",
-            25,
-            450_000,
-            true,
-            true,
-            true,
-            true,
-            true
-        );
-        assertGt(propId3, 0);
+        vm.warp(block.timestamp + 31 days);
+        vm.expectRevert("Quorum not reached");
+        dao.executeProposal(propId);
     }
 
-    function testImmutabilityAfterRevocation() public {
-        // Full lifecycle: Deploy -> Setup -> Rotate -> Revoke -> Immutable
-        vm.prank(adminOrchestrator);
-        dao.setupRoomieRobotAndLock(ROBOT_PQC_KEY);
-        assertTrue(dao.isRobotConfigured());
-        assertTrue(dao.isConfigUpdatable());
+    function test_QuorumMetAllowsExecution() public {
+        _commissionRobot();
+        _fundVault(VAULT_SEED);
+        _unlockVault();
 
-        // Rotate key
-        bytes32 key2 = keccak256("KEY_V2");
-        vm.prank(adminOrchestrator);
-        dao.updateRobotPqcPublicKey(key2);
-        assertEq(dao.getRobotPqcPublicKeyHash(), key2);
-
-        // Revoke
-        vm.prank(adminOrchestrator);
-        dao.revokeAndUpdateImmutability();
-        assertFalse(dao.isConfigUpdatable());
-
-        // All update paths blocked
-        vm.prank(adminOrchestrator);
-        vm.expectRevert("Robot configuration is permanently immutable");
-        dao.setupRoomieRobotAndLock(keccak256("KEY_V3"));
-
-        vm.prank(adminOrchestrator);
-        vm.expectRevert("Robot configuration is permanently immutable");
-        dao.updateRobotPqcPublicKey(keccak256("KEY_V3"));
-
-        vm.prank(adminOrchestrator);
-        vm.expectRevert("Already immutable");
-        dao.revokeAndUpdateImmutability();
-    }
-
-    function testOffGridMissionConstants() public view {
-        // Verify mission constants match requirements
-        assertEq(dao.MIN_FLOWERING_ACRES_TARGET(), 20);
-        assertEq(dao.OPTIMAL_BEE_INDEX_CAP(), 500_000);
-        assertTrue(bytes(dao.HABITAT_FOCUS_ZONE()).length > 0);
-    }
-
-    function testLpMonthlyIssuance100Tokens() public view {
-        assertEq(dao.MONTHLY_LP_ISSUANCE(), 100 * 1e18);
-    }
-
-    function testProposalThreshold50Lp() public view {
-        assertEq(dao.PROPOSAL_THRESHOLD(), 50 * 1e18);
-    }
-
-    function testVotingRatio1Lp1Vote() public {
-        vm.prank(adminOrchestrator);
-        dao.issueMonthlyLpTokens(daoMember, 100 * 1e18);
+        _issueLp(daoMember, 100 * 1e18);
+        _issueLp(daoMember2, 100 * 1e18);
 
         vm.prank(daoMember);
         uint256 propId = dao.createOffGridBeeHabitatProposal(
-            "Test",
-            25,
-            450_000,
-            true,
-            true,
-            true,
-            true,
-            true
+            "quorum met", 25, 100, 1_000 * 1e18, habitatOperator, true, true, true, true, true
         );
+        vm.prank(daoMember);
+        dao.vote(propId, true);
+        vm.prank(daoMember2);
+        dao.vote(propId, true);
 
+        vm.warp(block.timestamp + 31 days);
+        uint256 pid = dao.executeProposal(propId);
+        assertEq(pid, 1);
+    }
+
+    function test_RejectedProposalCannotExecute() public {
+        _commissionRobot();
+        _fundVault(VAULT_SEED);
+        _unlockVault();
+
+        _issueLp(daoMember, 100 * 1e18);
+        _issueLp(daoMember2, 100 * 1e18);
+
+        vm.prank(daoMember);
+        uint256 propId = dao.createOffGridBeeHabitatProposal(
+            "rejected", 25, 100, 1_000 * 1e18, habitatOperator, true, true, true, true, true
+        );
+        vm.prank(daoMember);
+        dao.vote(propId, false);
+        vm.prank(daoMember2);
+        dao.vote(propId, false);
+
+        vm.warp(block.timestamp + 31 days);
+        vm.expectRevert("Proposal rejected: against votes exceed for votes");
+        dao.executeProposal(propId);
+    }
+
+    function test_ProposalCannotBeExecutedTwice() public {
+        _commissionRobot();
+        _fundVault(VAULT_SEED);
+        _unlockVault();
+        _issueLp(daoMember, 100 * 1e18);
+
+        vm.prank(daoMember);
+        uint256 propId = dao.createOffGridBeeHabitatProposal(
+            "once", 25, 100, 1_000 * 1e18, habitatOperator, true, true, true, true, true
+        );
+        vm.prank(daoMember);
+        dao.vote(propId, true);
+        vm.warp(block.timestamp + 31 days);
+
+        dao.executeProposal(propId);
+        vm.expectRevert("Proposal already executed");
+        dao.executeProposal(propId);
+    }
+
+    function test_ExecutionBeforeVotingEndsReverts() public {
+        _commissionRobot();
+        _fundVault(VAULT_SEED);
+        _unlockVault();
+        _issueLp(daoMember, 100 * 1e18);
+
+        vm.prank(daoMember);
+        uint256 propId = dao.createOffGridBeeHabitatProposal(
+            "early", 25, 100, 1_000 * 1e18, habitatOperator, true, true, true, true, true
+        );
         vm.prank(daoMember);
         dao.vote(propId, true);
 
-        assertEq(dao.getProposalForVotes(propId), 100 * 1e18); // 100 LP = 100 votes
+        vm.expectRevert("Voting period not ended");
+        dao.executeProposal(propId);
     }
 
-    function testBondingCurveThreshold5BillionDai() public view {
-        assertEq(dao.BONDING_CURVE_DAI_UNLOCK_TARGET(), 5_000_000_000 * 1e18);
+    function test_ProjectCannotExceedItsShareOfTheVault() public {
+        _commissionRobot();
+        _fundVault(VAULT_SEED);
+        _unlockVault();
+        _issueLp(daoMember, 100 * 1e18);
+
+        uint256 tooMuch = (VAULT_SEED * 2_000) / 10_000 + 1; // one wei over 20%
+        vm.prank(daoMember);
+        uint256 propId = dao.createOffGridBeeHabitatProposal(
+            "greedy", 25, 100, tooMuch, habitatOperator, true, true, true, true, true
+        );
+        vm.prank(daoMember);
+        dao.vote(propId, true);
+        vm.warp(block.timestamp + 31 days);
+
+        vm.expectRevert("Exceeds max project share of vault");
+        dao.executeProposal(propId);
     }
 
-    function testRobotAuthorizedWallet() public view {
-        assertEq(dao.ADMIN_ORCHESTRATOR(), 0xaF570ce3b32D765b1236635B0f541a7487A1fB8e);
+    function test_RevertIf_ExecutingIntoAnEmptyVault() public {
+        _commissionRobot();
+        _unlockVault();
+        _issueLp(daoMember, 100 * 1e18);
+
+        vm.prank(daoMember);
+        uint256 propId = dao.createOffGridBeeHabitatProposal(
+            "no vault", 25, 100, 1e18, habitatOperator, true, true, true, true, true
+        );
+        vm.prank(daoMember);
+        dao.vote(propId, true);
+        vm.warp(block.timestamp + 31 days);
+
+        vm.expectRevert("Exceeds max project share of vault");
+        dao.executeProposal(propId);
     }
 
-    function testObsTokenAddress() public view {
-        assertEq(dao.OBS_TOKEN(), 0x2D8760e2877148d239a54952A458710553B2B54b);
+    /* ==================== FULL LIFECYCLE TO COMPLETION ==================== */
+
+    function test_FullProjectLifecycleThroughEveryMilestone() public {
+        _commissionRobot();
+        _fundVault(VAULT_SEED);
+        _unlockVault();
+
+        uint256 funding = 60_000 * 1e18;
+        uint256 projectId = _passProposal(funding);
+
+        uint32 count = dao.getProjectMilestoneCount(projectId);
+        uint256 cap = dao.getProjectPerMilestoneCap(projectId);
+        assertEq(count, 6);
+
+        uint256 releasedTotal;
+        for (uint32 i = 0; i < count; i++) {
+            if (i > 0) vm.warp(block.timestamp + 61 days);
+            uint256 remaining = dao.getProjectFundingRemaining(projectId);
+            uint256 amount = remaining < cap ? remaining : cap;
+            _releaseMilestone(projectId, amount);
+            releasedTotal += amount;
+        }
+
+        assertEq(releasedTotal, funding);
+        assertEq(dao.getProjectFundingRemaining(projectId), 0);
+        assertEq(dao.getProjectMilestonesCompleted(projectId), count);
+        assertEq(obs.balanceOf(habitatOperator), funding);
+        assertEq(dao.totalObsVaultBalance(), VAULT_SEED - funding);
+        assertEq(dao.totalReservedForProjects(), 0);
+
+        // Spending took at least 5 x 60 days: no instant drain, no instant price crash.
+        assertGe(block.timestamp - dao.getProjectStartTime(projectId), 5 * 60 days);
+
+        // A seventh authorisation is impossible: the schedule is exhausted.
+        vm.warp(block.timestamp + 61 days);
+        BeeHabitatDAO.MilestoneAttestation memory att = _goodAttestation();
+        bytes memory pqcSig = _validPqcSignature();
+        bytes32 pre = otsChain[otsCursor];
+        bytes memory sig = _mcuSign(projectId, 1e18, att, pqcSig, pre, mcuPrivKey);
+        vm.prank(ADMIN);
+        vm.expectRevert("All milestones already completed");
+        dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, pqcSig, sig, pre);
+
+        vm.prank(ADMIN);
+        dao.completeProject(projectId);
+        assertTrue(dao.getProjectCompleted(projectId));
+
+        assertEq(dao.beeFlourishingIndex(), 6 * 10_000);
+        assertFalse(dao.optimalBeeFlourishingReached());
+    }
+
+    function test_ProjectCannotBeCompletedEarly() public {
+        _commissionRobot();
+        _fundVault(VAULT_SEED);
+        _unlockVault();
+        uint256 projectId = _passProposal(60_000 * 1e18);
+
+        vm.prank(ADMIN);
+        vm.expectRevert("All milestones must be delivered");
+        dao.completeProject(projectId);
+
+        _releaseMilestone(projectId, 1e18);
+        vm.prank(ADMIN);
+        vm.expectRevert("All milestones must be delivered");
+        dao.completeProject(projectId);
+    }
+
+    function test_OptimalBeeFlourishingIndexIsReachable() public {
+        _commissionRobot();
+        _fundVault(VAULT_SEED);
+        _unlockVault();
+        uint256 projectId = _passProposal(60_000 * 1e18);
+
+        BeeHabitatDAO.MilestoneAttestation memory att = _goodAttestation();
+        att.beeFlourishingIndexDelta = 500_000;
+        bytes memory pqcSig = _validPqcSignature();
+        bytes32 pre = otsChain[otsCursor];
+        bytes memory sig = _mcuSign(projectId, 1e18, att, pqcSig, pre, mcuPrivKey);
+
+        vm.prank(ADMIN);
+        dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, pqcSig, sig, pre);
+
+        assertEq(dao.beeFlourishingIndex(), 500_000);
+        assertTrue(dao.optimalBeeFlourishingReached());
+    }
+
+    function test_BeeFlourishingIndexIsCappedAtTheOptimum() public {
+        _commissionRobot();
+        _fundVault(VAULT_SEED);
+        _unlockVault();
+        uint256 projectId = _passProposal(60_000 * 1e18);
+
+        BeeHabitatDAO.MilestoneAttestation memory att = _goodAttestation();
+        att.beeFlourishingIndexDelta = type(uint128).max;
+        bytes memory pqcSig = _validPqcSignature();
+        bytes32 pre = otsChain[otsCursor];
+        bytes memory sig = _mcuSign(projectId, 1e18, att, pqcSig, pre, mcuPrivKey);
+
+        vm.prank(ADMIN);
+        dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, pqcSig, sig, pre);
+        assertEq(dao.beeFlourishingIndex(), dao.OPTIMAL_BEE_INDEX_CAP());
+    }
+
+    /* ============================== TIMEOUT =============================== */
+
+    function test_TimeoutReturnsUnspentFundsToTheVaultRatherThanBurningThem() public {
+        _commissionRobot();
+        _fundVault(VAULT_SEED);
+        _unlockVault();
+
+        uint256 funding = 60_000 * 1e18;
+        uint256 projectId = _passProposal(funding);
+        _releaseMilestone(projectId, 1_000 * 1e18);
+
+        assertEq(dao.totalReservedForProjects(), funding - 1_000 * 1e18);
+
+        vm.warp(dao.getProjectDeadline(projectId) + 1);
+        dao.checkProjectTimeout(projectId);
+
+        assertTrue(dao.getProjectExpired(projectId));
+        assertEq(dao.getProjectFundingRemaining(projectId), 0);
+        assertEq(dao.totalReservedForProjects(), 0);
+        // Unspent OBS is still in the vault and still available to future projects.
+        assertEq(dao.totalObsVaultBalance(), VAULT_SEED - 1_000 * 1e18);
+        assertEq(dao.availableVaultBalance(), VAULT_SEED - 1_000 * 1e18);
+        assertEq(obs.balanceOf(address(dao)), VAULT_SEED - 1_000 * 1e18);
+    }
+
+    function test_TimeoutCannotFireEarly() public {
+        _commissionRobot();
+        _fundVault(VAULT_SEED);
+        _unlockVault();
+        uint256 projectId = _passProposal(60_000 * 1e18);
+
+        vm.expectRevert("Project deadline not reached");
+        dao.checkProjectTimeout(projectId);
+    }
+
+    function test_ExpiredProjectCannotSpendAgain() public {
+        _commissionRobot();
+        _fundVault(VAULT_SEED);
+        _unlockVault();
+        uint256 projectId = _passProposal(60_000 * 1e18);
+
+        vm.warp(dao.getProjectDeadline(projectId) + 1);
+        dao.checkProjectTimeout(projectId);
+
+        BeeHabitatDAO.MilestoneAttestation memory att = _goodAttestation();
+        bytes memory pqcSig = _validPqcSignature();
+        bytes32 pre = otsChain[otsCursor];
+        bytes memory sig = _mcuSign(projectId, 1e18, att, pqcSig, pre, mcuPrivKey);
+
+        vm.prank(ADMIN);
+        vm.expectRevert("Project expired");
+        dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, pqcSig, sig, pre);
+    }
+
+    /* ================= IMMUTABILITY AFTER REVOCATION ====================== */
+
+    function test_DaoKeepsOperatingAfterConfigurationIsFrozen() public {
+        _commissionRobot();
+        _fundVault(VAULT_SEED);
+        _unlockVault();
+
+        vm.prank(ADMIN);
+        dao.revokeAndUpdateImmutability();
+        assertFalse(dao.isConfigUpdatable());
+
+        // Configuration is sealed forever, but the mission continues to run under it.
+        uint256 projectId = _passProposal(60_000 * 1e18);
+        _releaseMilestone(projectId, 1_000 * 1e18);
+        assertEq(obs.balanceOf(habitatOperator), 1_000 * 1e18);
+
+        // And the sealed key is still the one enforcing every release.
+        assertEq(dao.getRobotPqcPublicKeyHash(), pqcPublicKeyHash);
+        assertEq(dao.getRobotMcuEcdsaSigner(), mcuSigner);
+    }
+
+    function test_RevokeBeforeCommissioningPermanentlyBricksSpending() public {
+        // Documents the ordering requirement: commission the hardware BEFORE revoking.
+        BeeHabitatDAO fresh = new BeeHabitatDAO();
+        vm.prank(ADMIN);
+        fresh.setupRoomieRobotAndLock(pqcPublicKeyHash);
+        vm.prank(ADMIN);
+        fresh.revokeAndUpdateImmutability();
+
+        vm.prank(ADMIN);
+        vm.expectRevert("Robot configuration is permanently immutable");
+        fresh.commissionRoomieRobot(pqcPublicKeyHash, mcuSigner, otsChain[OTS_LEN], uint64(OTS_LEN));
+
+        assertFalse(fresh.isRobotCommissioned());
+    }
+
+    /* ========================= ACCOUNTING SAFETY ========================== */
+
+    function test_VaultAccountingMatchesTokenBalanceThroughout() public {
+        _commissionRobot();
+        _fundVault(VAULT_SEED);
+        _unlockVault();
+        uint256 projectId = _passProposal(60_000 * 1e18);
+
+        assertEq(dao.totalObsVaultBalance(), obs.balanceOf(address(dao)));
+        _releaseMilestone(projectId, 5_000 * 1e18);
+        assertEq(dao.totalObsVaultBalance(), obs.balanceOf(address(dao)));
+
+        vm.warp(block.timestamp + 61 days);
+        _releaseMilestone(projectId, 5_000 * 1e18);
+        assertEq(dao.totalObsVaultBalance(), obs.balanceOf(address(dao)));
+        assertEq(dao.totalObsReleased(), 10_000 * 1e18);
+    }
+
+    function test_ConcurrentProjectsCannotOverCommitTheVault() public {
+        _commissionRobot();
+        _fundVault(VAULT_SEED);
+        _unlockVault();
+
+        // Each project may take at most 20% of what is still unreserved.
+        uint256 p1 = _passProposal((VAULT_SEED * 2_000) / 10_000);
+        assertEq(dao.totalReservedForProjects(), dao.getProjectFundingAmount(p1));
+
+        uint256 available = dao.availableVaultBalance();
+        _issueLp(daoMember2, 100 * 1e18);
+        vm.prank(daoMember2);
+        uint256 propId = dao.createOffGridBeeHabitatProposal(
+            "second", 25, 100, (available * 2_000) / 10_000 + 1, habitatOperator, true, true, true, true, true
+        );
+        vm.prank(daoMember2);
+        dao.vote(propId, true);
+        vm.warp(block.timestamp + 31 days);
+
+        vm.expectRevert("Exceeds max project share of vault");
+        dao.executeProposal(propId);
+
+        assertLe(dao.totalReservedForProjects(), dao.totalObsVaultBalance());
+    }
+
+    function testFuzz_VaultIsNeverOverCommitted(uint256 funding) public {
+        _commissionRobot();
+        _fundVault(VAULT_SEED);
+        _unlockVault();
+
+        funding = bound(funding, 1, (VAULT_SEED * 2_000) / 10_000);
+        uint256 pid = _passProposal(funding);
+
+        assertEq(dao.getProjectFundingAmount(pid), funding);
+        assertLe(dao.totalReservedForProjects(), dao.totalObsVaultBalance());
+        assertLe(dao.getProjectPerMilestoneCap(pid), dao.getProjectTrancheCeiling(pid));
+        assertGe(
+            uint256(dao.getProjectMilestoneCount(pid)) * dao.getProjectPerMilestoneCap(pid),
+            funding
+        );
     }
 }

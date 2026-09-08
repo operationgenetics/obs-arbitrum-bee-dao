@@ -1,14 +1,17 @@
 {
   "name": "obs-arbitrum-bee-dao",
   "version": "1.0.0",
-  "description": "Secure vault and DAO framework designed to lock funds until a **5 billion DAI bonding curve threshold** is achieved, after which operational control transfers exclusively to humanoid robots verified via a hybrid quantum-resistant chipset and multi-modal biometrics (facial, voice, and fingerprint templates).",
+  "description": "Immutable off-grid bee habitat DAO and OBS vault on Arbitrum One. Funds unlock only when the Obscura bonding curve reaches 5B DAI, then release in 60-day tranches under a hybrid post-quantum robot credential against hardcoded mission rules.",
   "main": "deploy.js",
   "directories": {
     "lib": "lib",
     "test": "test"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "forge build",
+    "test": "forge test",
+    "deploy": "node deploy.js",
+    "status": "node scripts/status.js"
   },
   "repository": {
     "type": "git",

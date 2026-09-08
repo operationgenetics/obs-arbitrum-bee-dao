@@ -1,253 +1,375 @@
-// SPDX-License-Identifier: AGPLv3-3.0
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "forge-std/Test.sol";
-import "../contracts/BeeHabitatDAO.sol";
+import {BeeHabitatHarness} from "./Harness.sol";
+import {BeeHabitatDAO} from "../contracts/BeeHabitatDAO.sol";
 
-contract BeeHabitatDAOAdvancedTest is Test {
-    BeeHabitatDAO public dao;
-    address adminOrchestrator = 0xaF570ce3b32D765b1236635B0f541a7487A1fB8e;
-    address daoMember = makeAddr("daoMember");
-    bytes32 constant DUMMY_PQC_KEY = keccak256("PQC_DILITHIUM_KEY_V1");
-    bytes constant VALID_SIGNATURE = hex"1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+/// @notice Hybrid post-quantum authorisation and the time-locked, mission-bound fund release path.
+contract BeeHabitatDAOAdvancedTest is BeeHabitatHarness {
+    uint256 internal projectId;
+    uint256 internal constant FUNDING = 60_000 * 1e18; // 6% of the seeded vault
 
-    function setUp() public {
-        dao = new BeeHabitatDAO();
-    }
-    
-    function testAdvancedDeployment() public {
-        assertEq(dao.obsToken(), 0x2D8760e2877148d239a54952A458710553B2B54b);
-        assertEq(dao.ADMIN_ORCHESTRATOR(), adminOrchestrator);
+    function setUp() public override {
+        super.setUp();
+        _commissionRobot();
+        _fundVault(VAULT_SEED);
+        _unlockVault();
+        projectId = _passProposal(FUNDING);
     }
 
-    function test_MissionEnforcementInProposals() public {
-        vm.prank(adminOrchestrator);
-        dao.issueMonthlyLpTokens(daoMember, 100 * 1e18);
+    /* -------------------- mathematical time-lock schedule ---------------- */
 
-        // Valid proposal with all mission criteria
-        vm.prank(daoMember);
-        uint256 propId = dao.createOffGridBeeHabitatProposal(
-            "Complete Off-Grid Bee Habitat",
-            50, // acres
-            400_000, // bee index
-            true, // solar + battery
-            true, // atmospheric water generation
-            true, // land acquisition
-            true, // equipment acquisition
-            true  // honey production & free distribution
-        );
+    function test_ProjectIsStretchedOverAMathematicalSchedule() public view {
+        uint32 count = dao.getProjectMilestoneCount(projectId);
+        uint256 cap = dao.getProjectPerMilestoneCap(projectId);
+        uint256 ceiling = dao.getProjectTrancheCeiling(projectId);
 
-        assertEq(propId, 1);
-    }
+        assertGe(count, dao.MIN_PROJECT_MILESTONES());
+        assertEq(ceiling, (VAULT_SEED * 250) / 10_000); // 2.5% anti-dump ceiling
+        assertLe(cap, ceiling);
+        assertGe(uint256(count) * cap, FUNDING); // the schedule can actually deliver the funding
 
-    function test_MissionCriteriaCannotBeBypassed() public {
-        vm.prank(adminOrchestrator);
-        dao.issueMonthlyLpTokens(daoMember, 100 * 1e18);
-
-        // Each mission criterion is mandatory
-        vm.prank(daoMember);
-        vm.expectRevert("Off-grid habitats must feature solar and battery storage");
-        dao.createOffGridBeeHabitatProposal("Test", 25, 450_000, false, true, true, true, true);
-
-        vm.prank(daoMember);
-        vm.expectRevert("Off-grid habitats must feature atmospheric water generation");
-        dao.createOffGridBeeHabitatProposal("Test", 25, 450_000, true, false, true, true, true);
-
-        vm.prank(daoMember);
-        vm.expectRevert("Must include land acquisition for permanent habitat");
-        dao.createOffGridBeeHabitatProposal("Test", 25, 450_000, true, true, false, true, true);
-
-        vm.prank(daoMember);
-        vm.expectRevert("Must include equipment for maintenance operations");
-        dao.createOffGridBeeHabitatProposal("Test", 25, 450_000, true, true, true, false, true);
-
-        vm.prank(daoMember);
-        vm.expectRevert("Must include honey production and free distribution");
-        dao.createOffGridBeeHabitatProposal("Test", 25, 450_000, true, true, true, true, false);
-    }
-
-    function test_BeeIndexCapEnforced() public {
-        vm.prank(adminOrchestrator);
-        dao.issueMonthlyLpTokens(daoMember, 100 * 1e18);
-
-        vm.prank(daoMember);
-        vm.expectRevert("Exceeds optimal safe carrying capacity index cap");
-        dao.createOffGridBeeHabitatProposal(
-            "Test",
-            25,
-            500_001, // Exceeds cap
-            true,
-            true,
-            true,
-            true,
-            true
+        // Deadline spans the entire schedule: 60 days per tranche plus grace.
+        assertEq(
+            dao.getProjectDeadline(projectId),
+            dao.getProjectStartTime(projectId) + uint256(count) * 60 days + 90 days
         );
     }
 
-    function test_MinimumAcreageEnforced() public {
-        vm.prank(adminOrchestrator);
-        dao.issueMonthlyLpTokens(daoMember, 100 * 1e18);
+    function test_FundingIsWhatTheDaoVotedOnNotWhatTheExecutorChooses() public view {
+        // executeProposal takes no amount argument; funding comes from the voted proposal.
+        assertEq(dao.getProjectFundingAmount(projectId), FUNDING);
+        assertEq(dao.getProjectFundingRemaining(projectId), FUNDING);
+        assertEq(dao.getProjectPayoutRecipient(projectId), habitatOperator);
+        assertEq(dao.totalReservedForProjects(), FUNDING);
+        assertEq(dao.availableVaultBalance(), VAULT_SEED - FUNDING);
+    }
 
-        vm.prank(daoMember);
-        vm.expectRevert("Must meet minimum bee forage acreage mandate");
-        dao.createOffGridBeeHabitatProposal(
-            "Test",
-            19, // Below minimum
-            450_000,
-            true,
-            true,
-            true,
-            true,
-            true
+    /* ------------------------ happy path release ------------------------- */
+
+    function test_RobotAuthorizedMilestoneReleasesToTheVotedRecipient() public {
+        uint256 amount = dao.getProjectPerMilestoneCap(projectId);
+        uint256 before = obs.balanceOf(habitatOperator);
+
+        _releaseMilestone(projectId, amount);
+
+        assertEq(obs.balanceOf(habitatOperator) - before, amount);
+        assertEq(dao.getProjectMilestonesCompleted(projectId), 1);
+        assertEq(dao.getProjectFundingRemaining(projectId), FUNDING - amount);
+        assertEq(dao.totalObsVaultBalance(), VAULT_SEED - amount);
+        assertEq(dao.totalObsReleased(), amount);
+        assertEq(dao.getRobotOtsRemaining(), uint64(OTS_LEN - 1));
+    }
+
+    function test_MissionLedgerAccumulatesRealWorldDelivery() public {
+        _releaseMilestone(projectId, 1e18);
+        BeeHabitatDAO.MissionLedger memory l = dao.getMissionLedger(projectId);
+        assertEq(l.acresSecured, 25);
+        assertEq(l.hivesInstalled, 40);
+        assertEq(l.honeyKgDistributedFree, 120);
+        assertEq(l.atmosphericWaterLiters, 9_000);
+        assertEq(l.solarKwhGenerated, 4_200);
+        assertEq(l.batteryKwhStored, 800);
+        assertEq(dao.beeFlourishingIndex(), 10_000);
+    }
+
+    /* ---------------- bi-monthly gating: 1x every 2 months ---------------- */
+
+    function test_MilestoneGatedToOncePerTwoMonths() public {
+        _releaseMilestone(projectId, 1e18);
+
+        vm.warp(block.timestamp + 59 days);
+        _expectMilestoneRevert(1e18, "Milestone locked: Bi-monthly cycle (1 time every 2 months) not reached");
+
+        vm.warp(block.timestamp + 1 days + 1);
+        _releaseMilestone(projectId, 1e18);
+        assertEq(dao.getProjectMilestonesCompleted(projectId), 2);
+    }
+
+    function test_NextMilestoneUnlockTimeIsExposed() public {
+        assertEq(dao.nextMilestoneUnlockTime(projectId), dao.getProjectStartTime(projectId));
+        _releaseMilestone(projectId, 1e18);
+        assertEq(dao.nextMilestoneUnlockTime(projectId), block.timestamp + 60 days);
+    }
+
+    /* --------------------- hybrid PQC: negative cases -------------------- */
+
+    function test_RevertIf_PqcPublicKeyDoesNotMatchCommitment() public {
+        BeeHabitatDAO.MilestoneAttestation memory att = _goodAttestation();
+        bytes memory pqcSig = _validPqcSignature();
+        bytes32 pre = otsChain[otsCursor];
+        bytes memory ecdsaSig = _mcuSign(projectId, 1e18, att, pqcSig, pre, mcuPrivKey);
+
+        bytes memory wrongKey = new bytes(1312);
+        wrongKey[0] = 0xFF;
+
+        vm.prank(ADMIN);
+        vm.expectRevert("PQC public key mismatch");
+        dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, wrongKey, pqcSig, ecdsaSig, pre);
+    }
+
+    function test_RevertIf_OtsPreimageIsWrong() public {
+        BeeHabitatDAO.MilestoneAttestation memory att = _goodAttestation();
+        bytes memory pqcSig = _validPqcSignature();
+        bytes32 badPre = keccak256("not-a-chain-link");
+        bytes memory ecdsaSig = _mcuSign(projectId, 1e18, att, pqcSig, badPre, mcuPrivKey);
+
+        vm.prank(ADMIN);
+        vm.expectRevert("Invalid PQC OTS preimage");
+        dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, pqcSig, ecdsaSig, badPre);
+    }
+
+    function test_RevertIf_OtsPreimageIsReplayed() public {
+        bytes32 used = otsChain[otsCursor];
+        _releaseMilestone(projectId, 1e18);
+        vm.warp(block.timestamp + 61 days);
+
+        // Replaying the consumed link no longer hashes to the advanced tip.
+        BeeHabitatDAO.MilestoneAttestation memory att = _goodAttestation();
+        bytes memory pqcSig = _validPqcSignature();
+        bytes memory ecdsaSig = _mcuSign(projectId, 1e18, att, pqcSig, used, mcuPrivKey);
+
+        vm.prank(ADMIN);
+        vm.expectRevert("Invalid PQC OTS preimage");
+        dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, pqcSig, ecdsaSig, used);
+    }
+
+    function test_RevertIf_PqcSignatureIsClassicallySized() public {
+        BeeHabitatDAO.MilestoneAttestation memory att = _goodAttestation();
+        bytes memory shortSig = new bytes(511); // one byte below the PQC floor
+        bytes32 pre = otsChain[otsCursor];
+        bytes memory ecdsaSig = _mcuSign(projectId, 1e18, att, shortSig, pre, mcuPrivKey);
+
+        vm.prank(ADMIN);
+        vm.expectRevert("PQC signature too short");
+        dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, shortSig, ecdsaSig, pre);
+    }
+
+    function test_RevertIf_EcdsaLegSignedByTheWrongKey() public {
+        BeeHabitatDAO.MilestoneAttestation memory att = _goodAttestation();
+        bytes memory pqcSig = _validPqcSignature();
+        bytes32 pre = otsChain[otsCursor];
+        bytes memory forged = _mcuSign(projectId, 1e18, att, pqcSig, pre, 0xDEADBEEF);
+
+        vm.prank(ADMIN);
+        vm.expectRevert("Invalid MCU ECDSA signature");
+        dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, pqcSig, forged, pre);
+    }
+
+    function test_RevertIf_EcdsaSignatureIsMalformed() public {
+        BeeHabitatDAO.MilestoneAttestation memory att = _goodAttestation();
+        bytes memory pqcSig = _validPqcSignature();
+        bytes32 pre = otsChain[otsCursor];
+
+        vm.prank(ADMIN);
+        vm.expectRevert("Invalid ECDSA signature length");
+        dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, pqcSig, hex"1234", pre);
+    }
+
+    function test_RevertIf_AmountIsTamperedAfterSigning() public {
+        BeeHabitatDAO.MilestoneAttestation memory att = _goodAttestation();
+        bytes memory pqcSig = _validPqcSignature();
+        bytes32 pre = otsChain[otsCursor];
+        bytes memory ecdsaSig = _mcuSign(projectId, 1e18, att, pqcSig, pre, mcuPrivKey);
+
+        // The MCU authorised 1 OBS; the orchestrator tries to push 2.
+        vm.prank(ADMIN);
+        vm.expectRevert("Invalid MCU ECDSA signature");
+        dao.robotAuthorizeAndReleaseMilestone(projectId, 2e18, att, pqcPublicKey, pqcSig, ecdsaSig, pre);
+    }
+
+    function test_RevertIf_AttestationIsTamperedAfterSigning() public {
+        BeeHabitatDAO.MilestoneAttestation memory att = _goodAttestation();
+        bytes memory pqcSig = _validPqcSignature();
+        bytes32 pre = otsChain[otsCursor];
+        bytes memory ecdsaSig = _mcuSign(projectId, 1e18, att, pqcSig, pre, mcuPrivKey);
+
+        att.honeyKgDistributedFree = 999_999; // inflate the claim after the robot signed
+        vm.prank(ADMIN);
+        vm.expectRevert("Invalid MCU ECDSA signature");
+        dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, pqcSig, ecdsaSig, pre);
+    }
+
+    function test_RevertIf_RobotNotCommissioned() public {
+        // Provisional setup only - no MCU hardware bound yet, so nothing can be spent.
+        BeeHabitatDAO fresh = new BeeHabitatDAO();
+        vm.prank(ADMIN);
+        fresh.setupRoomieRobotAndLock(pqcPublicKeyHash);
+        assertFalse(fresh.isRobotCommissioned());
+
+        obs.mint(funder, VAULT_SEED);
+        vm.startPrank(funder);
+        obs.approve(address(fresh), VAULT_SEED);
+        fresh.depositToVault(VAULT_SEED);
+        vm.stopPrank();
+        obs.setDaiReserve(fresh.BONDING_CURVE_DAI_UNLOCK_TARGET());
+        fresh.checkAndUnlockVault();
+
+        uint256 pid = _passProposalOn(fresh, 60_000 * 1e18);
+
+        BeeHabitatDAO.MilestoneAttestation memory att = _goodAttestation();
+        bytes memory pqcSig = _validPqcSignature();
+        bytes32 pre = otsChain[OTS_LEN - 1];
+        bytes memory sig = _mcuSignOn(fresh, pid, 1e18, att, pqcSig, pre, mcuPrivKey);
+
+        vm.prank(ADMIN);
+        vm.expectRevert("Roomie robot MCU not commissioned");
+        fresh.robotAuthorizeAndReleaseMilestone(pid, 1e18, att, pqcPublicKey, pqcSig, sig, pre);
+    }
+
+    function test_OtsChainExhaustionStopsSpending() public {
+        // Commission a one-shot chain, then prove the second authorisation is impossible.
+        BeeHabitatDAO fresh = _freshFundedDao(1);
+        uint256 pid = _passProposalOn(fresh, 60_000 * 1e18);
+
+        _releaseOn(fresh, pid, 1e18, otsChain[OTS_LEN - 1]);
+        assertEq(fresh.getRobotOtsRemaining(), 0);
+
+        vm.warp(block.timestamp + 61 days);
+        BeeHabitatDAO.MilestoneAttestation memory att = _goodAttestation();
+        bytes memory pqcSig = _validPqcSignature();
+        bytes32 pre = otsChain[OTS_LEN - 2];
+        bytes memory sig = _mcuSignOn(fresh, pid, 1e18, att, pqcSig, pre, mcuPrivKey);
+
+        vm.prank(ADMIN);
+        vm.expectRevert("PQC OTS chain exhausted");
+        fresh.robotAuthorizeAndReleaseMilestone(pid, 1e18, att, pqcPublicKey, pqcSig, sig, pre);
+    }
+
+    /* ------------------ hardcoded mission rules at spend ------------------ */
+
+    function test_EveryMissionRuleIsReEnforcedAtEveryRelease() public {
+        _assertRuleBlocks(_mutate(0), "Mission rule: site must be fully off-grid");
+        _assertRuleBlocks(_mutate(1), "Mission rule: solar generation required");
+        _assertRuleBlocks(_mutate(2), "Mission rule: battery storage required");
+        _assertRuleBlocks(_mutate(3), "Mission rule: atmospheric water generation required");
+        _assertRuleBlocks(_mutate(4), "Mission rule: free honey distribution required");
+        _assertRuleBlocks(_mutate(5), "Mission rule: indoor bee habitat hives required");
+        _assertRuleBlocks(_mutate(6), "Mission rule: land must be acquired/held");
+        _assertRuleBlocks(_mutate(7), "Mission rule: maintenance equipment must be operational");
+        _assertRuleBlocks(_mutate(8), "Mission rule: robot evidence bundle required");
+    }
+
+    /* --------------------------- anti-dump caps -------------------------- */
+
+    function test_RevertIf_TrancheExceedsPerMilestoneCap() public {
+        uint256 cap = dao.getProjectPerMilestoneCap(projectId);
+        _expectMilestoneRevert(cap + 1, "Exceeds per-milestone cap");
+    }
+
+    function test_FullFundingCannotBeDrainedInOneTransaction() public {
+        _expectMilestoneRevert(FUNDING, "Exceeds per-milestone cap");
+    }
+
+    /* ---------------------- authorisation surface ------------------------ */
+
+    function test_RevertIf_NonAdminTriesToRelease() public {
+        BeeHabitatDAO.MilestoneAttestation memory att = _goodAttestation();
+        bytes memory pqcSig = _validPqcSignature();
+        bytes32 pre = otsChain[otsCursor];
+        bytes memory sig = _mcuSign(projectId, 1e18, att, pqcSig, pre, mcuPrivKey);
+
+        vm.prank(unauthorizedUser);
+        vm.expectRevert("Unauthorized: Must match hardware orchestrator");
+        dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, pqcSig, sig, pre);
+    }
+
+    /* ------------------------------ helpers ------------------------------ */
+
+    function _expectMilestoneRevert(uint256 amount, string memory reason) internal {
+        BeeHabitatDAO.MilestoneAttestation memory att = _goodAttestation();
+        bytes memory pqcSig = _validPqcSignature();
+        bytes32 pre = otsChain[otsCursor];
+        bytes memory sig = _mcuSign(projectId, amount, att, pqcSig, pre, mcuPrivKey);
+
+        vm.prank(ADMIN);
+        vm.expectRevert(bytes(reason));
+        dao.robotAuthorizeAndReleaseMilestone(projectId, amount, att, pqcPublicKey, pqcSig, sig, pre);
+    }
+
+    function _mutate(uint256 which) internal pure returns (BeeHabitatDAO.MilestoneAttestation memory a) {
+        a = _goodAttestation();
+        if (which == 0) a.offGridVerified = false;
+        else if (which == 1) a.solarKwhGenerated = 0;
+        else if (which == 2) a.batteryKwhStored = 0;
+        else if (which == 3) a.atmosphericWaterLiters = 0;
+        else if (which == 4) a.honeyKgDistributedFree = 0;
+        else if (which == 5) a.hivesInstalled = 0;
+        else if (which == 6) a.landAcquired = false;
+        else if (which == 7) a.equipmentOperational = false;
+        else a.evidenceHash = bytes32(0);
+    }
+
+    function _assertRuleBlocks(BeeHabitatDAO.MilestoneAttestation memory att, string memory reason) internal {
+        bytes memory pqcSig = _validPqcSignature();
+        bytes32 pre = otsChain[otsCursor];
+        bytes memory sig = _mcuSign(projectId, 1e18, att, pqcSig, pre, mcuPrivKey);
+
+        vm.prank(ADMIN);
+        vm.expectRevert(bytes(reason));
+        dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, pqcSig, sig, pre);
+    }
+
+    function _freshFundedDao(uint64 otsLength) internal returns (BeeHabitatDAO fresh) {
+        fresh = new BeeHabitatDAO();
+        vm.prank(ADMIN);
+        fresh.commissionRoomieRobot(pqcPublicKeyHash, mcuSigner, otsChain[OTS_LEN], otsLength);
+
+        obs.mint(funder, VAULT_SEED);
+        vm.startPrank(funder);
+        obs.approve(address(fresh), VAULT_SEED);
+        fresh.depositToVault(VAULT_SEED);
+        vm.stopPrank();
+
+        obs.setDaiReserve(fresh.BONDING_CURVE_DAI_UNLOCK_TARGET());
+        fresh.checkAndUnlockVault();
+    }
+
+    function _passProposalOn(BeeHabitatDAO d, uint256 funding) internal returns (uint256) {
+        vm.prank(ADMIN);
+        d.issueMonthlyLpTokens(daoMember2, 100 * 1e18);
+        vm.prank(daoMember2);
+        uint256 propId = d.createOffGridBeeHabitatProposal(
+            "off-grid apiary", 25, 250_000, funding, habitatOperator, true, true, true, true, true
         );
+        vm.prank(daoMember2);
+        d.vote(propId, true);
+        vm.warp(block.timestamp + 31 days);
+        return d.executeProposal(propId);
     }
 
-    function test_LpAccumulationWithinMonth() public {
-        vm.prank(adminOrchestrator);
-        dao.issueMonthlyLpTokens(daoMember, 50 * 1e18);
-        assertEq(dao.getVotingPower(daoMember), 50 * 1e18);
-
-        // Add more within same month
-        vm.prank(adminOrchestrator);
-        dao.issueMonthlyLpTokens(daoMember, 30 * 1e18);
-        assertEq(dao.getVotingPower(daoMember), 80 * 1e18);
-
-        // Cannot exceed monthly limit in single issuance
-        vm.expectRevert("Exceeds monthly issuance limit");
-        vm.prank(adminOrchestrator);
-        dao.issueMonthlyLpTokens(daoMember, 101 * 1e18);
-    }
-
-    function test_RobotKeyRotationBeforeRevocation() public {
-        vm.prank(adminOrchestrator);
-        dao.setupRoomieRobotAndLock(DUMMY_PQC_KEY);
-        assertEq(dao.getRobotPqcPublicKeyHash(), DUMMY_PQC_KEY);
-
-        // Rotate key
-        bytes32 newKey = keccak256("NEW_ROBOT_KEY_V2");
-        vm.prank(adminOrchestrator);
-        dao.updateRobotPqcPublicKey(newKey);
-        assertEq(dao.getRobotPqcPublicKeyHash(), newKey);
-
-        // Can rotate multiple times before revocation
-        bytes32 newerKey = keccak256("NEW_ROBOT_KEY_V3");
-        vm.prank(adminOrchestrator);
-        dao.updateRobotPqcPublicKey(newerKey);
-        assertEq(dao.getRobotPqcPublicKeyHash(), newerKey);
-    }
-
-    function test_RobotKeyRotationAfterRevocationFails() public {
-        vm.prank(adminOrchestrator);
-        dao.setupRoomieRobotAndLock(DUMMY_PQC_KEY);
-        vm.prank(adminOrchestrator);
-        dao.revokeAndUpdateImmutability();
-
-        vm.expectRevert("Robot configuration is permanently immutable");
-        vm.prank(adminOrchestrator);
-        dao.updateRobotPqcPublicKey(keccak256("NEW_KEY"));
-    }
-
-    function test_FullProposalLifecycle() public {
-        // Unlock vault
-        dao.checkAndUnlockVault(5_000_000_000 * 1e18);
-
-        // Setup robot
-        vm.prank(adminOrchestrator);
-        dao.setupRoomieRobotAndLock(DUMMY_PQC_KEY);
-
-        // Issue LP tokens
-        vm.prank(adminOrchestrator);
-        dao.issueMonthlyLpTokens(daoMember, 100 * 1e18);
-
-        // Create proposal
-        vm.prank(daoMember);
-        uint256 propId = dao.createOffGridBeeHabitatProposal(
-            "Solar-Powered Bee Sanctuary with AWG",
-            30,
-            300_000,
-            true,
-            true,
-            true,
-            true,
-            true
+    function _mcuSignOn(
+        BeeHabitatDAO d,
+        uint256 pid,
+        uint256 amount,
+        BeeHabitatDAO.MilestoneAttestation memory att,
+        bytes memory pqcSig,
+        bytes32 pre,
+        uint256 key
+    ) internal view returns (bytes memory) {
+        bytes32 actionDigest = keccak256(
+            abi.encode(
+                d.MILESTONE_TYPEHASH(),
+                pid,
+                d.getProjectMilestonesCompleted(pid),
+                amount,
+                d.getProjectPayoutRecipient(pid),
+                _attestationHash(att)
+            )
         );
-
-        // Vote
-        vm.prank(daoMember);
-        dao.vote(propId, true);
-
-        // Wait for voting period
-        skip(31 days);
-
-        // Execute proposal (creates project)
-        vm.prank(adminOrchestrator);
-        dao.executeProposal(propId, 5_000 * 1e18);
-
-        assertEq(dao.getProjectCount(), 1);
-
-        // Robot authorizes first milestone
-        vm.prank(adminOrchestrator);
-        dao.robotAuthorizeProjectMilestone(1, VALID_SIGNATURE);
-
-        assertTrue(dao.getProjectFundsReleased(1));
-
-        // Wait 60 days for next milestone
-        skip(61 days);
-
-        // Still fails because funds still released from first milestone
-        // (withdrawal would reset this, but requires token balance)
-        vm.expectRevert("Funds already released for current milestone");
-        vm.prank(adminOrchestrator);
-        dao.robotAuthorizeProjectMilestone(1, VALID_SIGNATURE);
+        bytes32 payload = keccak256(
+            abi.encode(block.chainid, address(d), actionDigest, d.getRobotPqcPublicKeyHash(), keccak256(pqcSig), pre)
+        );
+        (uint8 v, bytes32 r, bytes32 s) =
+            vm.sign(key, keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", payload)));
+        return abi.encodePacked(r, s, v);
     }
 
-    function test_TwoMonthAuthorizationCycleEnforced() public {
-        dao.checkAndUnlockVault(5_000_000_000 * 1e18);
-        vm.prank(adminOrchestrator);
-        dao.setupRoomieRobotAndLock(DUMMY_PQC_KEY);
-
-        vm.prank(adminOrchestrator);
-        dao.issueMonthlyLpTokens(daoMember, 100 * 1e18);
-
-        vm.prank(daoMember);
-        uint256 propId = dao.createOffGridBeeHabitatProposal(
-            "Test",
-            25,
-            450_000,
-            true,
-            true,
-            true,
-            true,
-            true
-        );
-
-        vm.prank(daoMember);
-        dao.vote(propId, true);
-
-        skip(31 days);
-
-        vm.prank(adminOrchestrator);
-        dao.executeProposal(propId, 1000 * 1e18);
-
-        // First authorization
-        vm.prank(adminOrchestrator);
-        dao.robotAuthorizeProjectMilestone(1, VALID_SIGNATURE);
-
-        // Try again immediately - should fail (funds already released)
-        vm.expectRevert("Funds already released for current milestone");
-        vm.prank(adminOrchestrator);
-        dao.robotAuthorizeProjectMilestone(1, VALID_SIGNATURE);
-
-        // Wait 59 days - should still fail (funds still released)
-        skip(59 days);
-        vm.expectRevert("Funds already released for current milestone");
-        vm.prank(adminOrchestrator);
-        dao.robotAuthorizeProjectMilestone(1, VALID_SIGNATURE);
-
-        // Wait 1 more day (60 total) - still fails because funds still released
-        skip(1 days);
-        vm.expectRevert("Funds already released for current milestone");
-        vm.prank(adminOrchestrator);
-        dao.robotAuthorizeProjectMilestone(1, VALID_SIGNATURE);
+    function _releaseOn(BeeHabitatDAO d, uint256 pid, uint256 amount, bytes32 pre) internal {
+        BeeHabitatDAO.MilestoneAttestation memory att = _goodAttestation();
+        bytes memory pqcSig = _validPqcSignature();
+        bytes memory sig = _mcuSignOn(d, pid, amount, att, pqcSig, pre, mcuPrivKey);
+        vm.prank(ADMIN);
+        d.robotAuthorizeAndReleaseMilestone(pid, amount, att, pqcPublicKey, pqcSig, sig, pre);
     }
 }
