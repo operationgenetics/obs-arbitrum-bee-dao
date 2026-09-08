@@ -9,7 +9,13 @@
   },
   "scripts": {
     "build": "forge build",
-    "test": "forge test",
+    "test": "forge test --no-match-path 'test/BeeHabitatDAOInvariants.t.sol'",
+    "test:all": "forge test",
+    "test:invariant": "forge test --match-path 'test/BeeHabitatDAOInvariants.t.sol'",
+    "test:audit": "forge test --profile audit",
+    "gas": "forge test --gas-report --no-match-path 'test/BeeHabitatDAOInvariants.t.sol'",
+    "slither": "slither contracts/BeeHabitatDAO.sol --solc-remaps '@openzeppelin/=lib/openzeppelin-contracts/' --exclude-dependencies --filter-paths lib/",
+    "deploy:dry": "node deploy.js --dry-run",
     "deploy": "node deploy.js",
     "status": "node scripts/status.js"
   },

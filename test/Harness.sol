@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {BeeHabitatDAO} from "../contracts/BeeHabitatDAO.sol";
@@ -181,7 +181,7 @@ abstract contract BeeHabitatHarness is Test {
         bytes memory pqcSig,
         bytes32 otsPreimage,
         uint256 signingKey
-    ) internal view returns (bytes memory) {
+    ) internal returns (bytes memory) {
         bytes32 actionDigest = keccak256(
             abi.encode(
                 dao.MILESTONE_TYPEHASH(),
@@ -233,7 +233,7 @@ abstract contract BeeHabitatHarness is Test {
         );
         vm.prank(daoMember);
         dao.vote(propId, true);
-        vm.warp(block.timestamp + 31 days);
+        vm.warp(vm.getBlockTimestamp() + 31 days);
         projectId = dao.executeProposal(propId);
     }
 }

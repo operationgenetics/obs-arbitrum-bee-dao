@@ -119,14 +119,32 @@ under-funded curve.
 
 ```bash
 forge build
-node deploy.js
+node deploy.js --dry-run   # preflight + gas quote, no wallet, nothing sent
+node deploy.js             # the real thing
 ```
 
 Nothing to fill in: no constructor arguments, no addresses, no environment variables, no edits
-to the deploy script. It runs a preflight against Arbitrum One (confirming the OBS token and
-that the compiled bytecode really references it), shows a QR code, and deploys when you sign in
-MetaMask. If you connect with the orchestrator wallet it will also offer the immediate
-`setupRoomieRobotAndLock` provisioning transaction. The address is written to `deployment.json`.
+to the deploy script. It shows a QR code, you scan it with MetaMask, and you sign.
+
+Before it asks for a wallet it proves the artifact against the live chain: that the OBS token
+exists and reports symbol `OBS`, and that the compiled bytecode genuinely embeds both the OBS
+token and the orchestrator address. It then quotes the gas and waits for your confirmation.
+
+**Gas.** Arbitrum prices a deployment mostly by the L1 calldata needed to post the contract code.
+Two levers are applied:
+
+- `maxPriorityFeePerGas` is set to **0**. Arbitrum's sequencer is first-come-first-served and
+  ignores tips, so any tip is money burned for no ordering benefit.
+- `maxFeePerGas` is pinned to base fee + 25% rather than ethers' default 2x headroom, so the
+  maximum your wallet displays is honest. Unused gas price is refunded either way.
+
+Converting the revert strings to custom errors during the audit pass cut the creation code from
+18,947 to 13,684 bytes, a **28% reduction**, which comes straight off the deployment fee. At a
+0.02 gwei base fee the deployment costs roughly **0.000064 ETH**.
+
+After a successful deploy the address is written to `deployment.json` and the script prints the
+`forge verify-contract` command for Arbiscan. If you connected with the orchestrator wallet it
+also offers the immediate `setupRoomieRobotAndLock` provisioning transaction.
 
 ## Operating
 
@@ -173,15 +191,113 @@ signer locally before it will send anything.
 
 ---
 
-## Tests
+## Build and test
 
 ```bash
-forge test
+forge build          # reproducible: solc, EVM version, optimizer and via-IR are all pinned
+forge test           # 75 unit/fuzz tests + 7 stateful invariants
+forge test --profile audit   # 20,000 fuzz runs per property, for pre-deployment sign-off
+slither contracts/BeeHabitatDAO.sol \
+  --solc-remaps "@openzeppelin/=lib/openzeppelin-contracts/" --exclude-dependencies
 ```
 
-75 tests across three suites: core governance and wiring, hybrid-PQC and fund release, and a
-full end-to-end audit with fuzzing. Coverage includes the complete six-milestone lifecycle to
-completion, quorum enforcement, timeout refunds, vault-accounting invariants, and negative cases
-for every leg of the hybrid credential — wrong PQC key, wrong or replayed OTS link,
-classically-sized PQC signature, wrong ECDSA signer, and tampering with the amount or the
-attestation after signing.
+### Suites
+
+| Suite | Covers |
+|---|---|
+| `BeeHabitatDAO.t.sol` | wiring, robot lifecycle, LP economics, proposals, voting, vault, unlock |
+| `BeeHabitatDAOAdvanced.t.sol` | hybrid-PQC verification and the time-locked release path |
+| `BeeHabitatDAOFullAudit.t.sol` | end-to-end lifecycle, quorum, timeouts, immutability, accounting |
+| `BeeHabitatDAOInvariants.t.sol` | 7 stateful invariants over randomised operation sequences |
+
+Negative coverage exists for every leg of the hybrid credential: wrong PQC key, wrong or
+replayed OTS link, classically-sized PQC signature, wrong ECDSA signer, malformed signature, and
+tampering with the amount or the attestation after signing.
+
+### Invariants
+
+Held across 128,000 randomised calls, including fully valid hybrid-PQC releases:
+
+1. Reservations never exceed the vault.
+2. Internal accounting always equals the real token balance.
+3. OBS is conserved: deposited equals held plus released.
+4. Reservations equal exactly the sum of live project remainders.
+5. Nothing leaves while the bonding-curve gate is shut.
+6. No project ever overdraws its funding or milestone count.
+7. The bee flourishing index never exceeds the safe carrying-capacity cap.
+
+## Static analysis
+
+Slither reports **no high or medium severity findings**. The remaining informational results are
+accepted and documented:
+
+| Finding | Why it is accepted |
+|---|---|
+| `timestamp` (7 sites) | All windows are 30 or 60 days. Arbitrum sequencer clock drift is bounded and orders of magnitude smaller. |
+| `incorrect-equality` | Compares epoch *indices*, not raw timestamps. |
+| `assembly` | One `memory-safe` block for ECDSA calldata loads in {_recoverSigner}. |
+| `low-level-calls` | Two `staticcall`s to read the OBS curve. Deliberate: the token's ABI is not guaranteed, and the unlock fails closed if either is unavailable. |
+| `cyclomatic-complexity` | Sequential, explicit guard clauses in the proposal and release paths. |
+
+## Build reproducibility
+
+| Setting | Value |
+|---|---|
+| solc | `0.8.28` (exact, not floating) |
+| EVM version | `shanghai` |
+| Optimizer | enabled, 200 runs |
+| IR pipeline | `via_ir = true` |
+
+> Solc `0.8.20` was rejected during the audit pass: it carries
+> `FullInlinerNonExpressionSplitArgumentEvaluationOrder`, a via-IR full-inliner bug, and this
+> contract compiles with `via_ir`. `0.8.28` fixes it and produces 429 fewer bytes.
+
+### A note for anyone extending the tests
+
+Under `via_ir` on 0.8.28 the optimizer may cache `block.timestamp` in a stack slot across an
+external call, because the compiler is entitled to assume TIMESTAMP is invariant within a call
+frame. `vm.warp` breaks that assumption, so a second `vm.warp(block.timestamp + delta)` in the
+same test can silently warp to the *same* absolute time. The suite therefore uses
+`vm.warp(vm.getBlockTimestamp() + delta)` throughout. Contract code is unaffected, since every
+contract entry point is its own external call.
+
+---
+
+## Audit posture
+
+| Item | Status |
+|---|---|
+| Constructor arguments | none — nothing to get wrong at deploy time |
+| Owner / admin transfer / renounce | none |
+| Proxy / upgrade path | none |
+| Pause / emergency switch | none |
+| `delegatecall` / `selfdestruct` | none |
+| Outbound token transfers | exactly one, in the robot-authorized milestone path |
+| Arbitrary-recipient withdrawal | none — the recipient is fixed by the DAO vote |
+| `require` strings remaining | 0 — 74 typed custom errors |
+| State-changing external functions | 14 |
+| Slither high / medium findings | 0 |
+| Unit + fuzz tests | 75 passing |
+| Stateful invariants | 7, over 128,000 randomised calls, 0 reverts |
+| Deep fuzz | 20,000 runs per property |
+| Creation code | 13,684 bytes (limit 49,152) |
+
+### Known, accepted design properties
+
+These are deliberate consequences of the requested design, not defects. They are listed so no
+reviewer has to rediscover them.
+
+1. **The orchestrator wallet controls LP issuance,** and therefore controls governance outcomes.
+   The vote is a safety rail and an audit trail, not a check on that wallet.
+2. **Freezing configuration is irreversible and order-dependent.** Calling
+   `revokeAndUpdateImmutability()` before `commissionRoomieRobot()` permanently prevents every
+   fund release. The contract cannot stop a direct call; the script refuses, and a test documents
+   it.
+3. **The OTS chain length is a hard spending ceiling.** Once exhausted, no further release is
+   possible and configuration cannot be rotated if it has been frozen. Size the chain generously.
+4. **The vault unlock is one-way.** If the OBS token's `daiReserve()` were ever to report a value
+   at or above the target, the unlock is permanent.
+5. **Milestone attestations are trusted inputs from the robot.** The contract enforces their
+   *shape* and binds them cryptographically to the MCU; it cannot verify that the physical world
+   matches them. That assurance comes from the hardware, the biometric gate, and the evidence
+   bundle referenced by `evidenceHash`.

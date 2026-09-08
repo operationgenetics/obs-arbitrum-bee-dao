@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.28;
 
 import {BeeHabitatHarness} from "./Harness.sol";
 import {BeeHabitatDAO} from "../contracts/BeeHabitatDAO.sol";
@@ -19,7 +19,7 @@ contract BeeHabitatDAOAdvancedTest is BeeHabitatHarness {
 
     /* -------------------- mathematical time-lock schedule ---------------- */
 
-    function test_ProjectIsStretchedOverAMathematicalSchedule() public view {
+    function test_ProjectIsStretchedOverAMathematicalSchedule() public {
         uint32 count = dao.getProjectMilestoneCount(projectId);
         uint256 cap = dao.getProjectPerMilestoneCap(projectId);
         uint256 ceiling = dao.getProjectTrancheCeiling(projectId);
@@ -78,10 +78,10 @@ contract BeeHabitatDAOAdvancedTest is BeeHabitatHarness {
     function test_MilestoneGatedToOncePerTwoMonths() public {
         _releaseMilestone(projectId, 1e18);
 
-        vm.warp(block.timestamp + 59 days);
-        _expectMilestoneRevert(1e18, "Milestone locked: Bi-monthly cycle (1 time every 2 months) not reached");
+        vm.warp(vm.getBlockTimestamp() + 59 days);
+        _expectMilestoneRevert(1e18, BeeHabitatDAO.MilestoneLocked.selector);
 
-        vm.warp(block.timestamp + 1 days + 1);
+        vm.warp(vm.getBlockTimestamp() + 1 days + 1);
         _releaseMilestone(projectId, 1e18);
         assertEq(dao.getProjectMilestonesCompleted(projectId), 2);
     }
@@ -89,7 +89,7 @@ contract BeeHabitatDAOAdvancedTest is BeeHabitatHarness {
     function test_NextMilestoneUnlockTimeIsExposed() public {
         assertEq(dao.nextMilestoneUnlockTime(projectId), dao.getProjectStartTime(projectId));
         _releaseMilestone(projectId, 1e18);
-        assertEq(dao.nextMilestoneUnlockTime(projectId), block.timestamp + 60 days);
+        assertEq(dao.nextMilestoneUnlockTime(projectId), vm.getBlockTimestamp() + 60 days);
     }
 
     /* --------------------- hybrid PQC: negative cases -------------------- */
@@ -104,7 +104,7 @@ contract BeeHabitatDAOAdvancedTest is BeeHabitatHarness {
         wrongKey[0] = 0xFF;
 
         vm.prank(ADMIN);
-        vm.expectRevert("PQC public key mismatch");
+        vm.expectRevert(BeeHabitatDAO.PqcPublicKeyMismatch.selector);
         dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, wrongKey, pqcSig, ecdsaSig, pre);
     }
 
@@ -115,14 +115,14 @@ contract BeeHabitatDAOAdvancedTest is BeeHabitatHarness {
         bytes memory ecdsaSig = _mcuSign(projectId, 1e18, att, pqcSig, badPre, mcuPrivKey);
 
         vm.prank(ADMIN);
-        vm.expectRevert("Invalid PQC OTS preimage");
+        vm.expectRevert(BeeHabitatDAO.InvalidOtsPreimage.selector);
         dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, pqcSig, ecdsaSig, badPre);
     }
 
     function test_RevertIf_OtsPreimageIsReplayed() public {
         bytes32 used = otsChain[otsCursor];
         _releaseMilestone(projectId, 1e18);
-        vm.warp(block.timestamp + 61 days);
+        vm.warp(vm.getBlockTimestamp() + 61 days);
 
         // Replaying the consumed link no longer hashes to the advanced tip.
         BeeHabitatDAO.MilestoneAttestation memory att = _goodAttestation();
@@ -130,7 +130,7 @@ contract BeeHabitatDAOAdvancedTest is BeeHabitatHarness {
         bytes memory ecdsaSig = _mcuSign(projectId, 1e18, att, pqcSig, used, mcuPrivKey);
 
         vm.prank(ADMIN);
-        vm.expectRevert("Invalid PQC OTS preimage");
+        vm.expectRevert(BeeHabitatDAO.InvalidOtsPreimage.selector);
         dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, pqcSig, ecdsaSig, used);
     }
 
@@ -141,7 +141,7 @@ contract BeeHabitatDAOAdvancedTest is BeeHabitatHarness {
         bytes memory ecdsaSig = _mcuSign(projectId, 1e18, att, shortSig, pre, mcuPrivKey);
 
         vm.prank(ADMIN);
-        vm.expectRevert("PQC signature too short");
+        vm.expectRevert(BeeHabitatDAO.PqcSignatureTooShort.selector);
         dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, shortSig, ecdsaSig, pre);
     }
 
@@ -152,7 +152,7 @@ contract BeeHabitatDAOAdvancedTest is BeeHabitatHarness {
         bytes memory forged = _mcuSign(projectId, 1e18, att, pqcSig, pre, 0xDEADBEEF);
 
         vm.prank(ADMIN);
-        vm.expectRevert("Invalid MCU ECDSA signature");
+        vm.expectRevert(BeeHabitatDAO.EcdsaSignerMismatch.selector);
         dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, pqcSig, forged, pre);
     }
 
@@ -162,7 +162,7 @@ contract BeeHabitatDAOAdvancedTest is BeeHabitatHarness {
         bytes32 pre = otsChain[otsCursor];
 
         vm.prank(ADMIN);
-        vm.expectRevert("Invalid ECDSA signature length");
+        vm.expectRevert(BeeHabitatDAO.InvalidEcdsaSignatureLength.selector);
         dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, pqcSig, hex"1234", pre);
     }
 
@@ -174,7 +174,7 @@ contract BeeHabitatDAOAdvancedTest is BeeHabitatHarness {
 
         // The MCU authorised 1 OBS; the orchestrator tries to push 2.
         vm.prank(ADMIN);
-        vm.expectRevert("Invalid MCU ECDSA signature");
+        vm.expectRevert(BeeHabitatDAO.EcdsaSignerMismatch.selector);
         dao.robotAuthorizeAndReleaseMilestone(projectId, 2e18, att, pqcPublicKey, pqcSig, ecdsaSig, pre);
     }
 
@@ -186,7 +186,7 @@ contract BeeHabitatDAOAdvancedTest is BeeHabitatHarness {
 
         att.honeyKgDistributedFree = 999_999; // inflate the claim after the robot signed
         vm.prank(ADMIN);
-        vm.expectRevert("Invalid MCU ECDSA signature");
+        vm.expectRevert(BeeHabitatDAO.EcdsaSignerMismatch.selector);
         dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, pqcSig, ecdsaSig, pre);
     }
 
@@ -213,7 +213,7 @@ contract BeeHabitatDAOAdvancedTest is BeeHabitatHarness {
         bytes memory sig = _mcuSignOn(fresh, pid, 1e18, att, pqcSig, pre, mcuPrivKey);
 
         vm.prank(ADMIN);
-        vm.expectRevert("Roomie robot MCU not commissioned");
+        vm.expectRevert(BeeHabitatDAO.RobotNotCommissioned.selector);
         fresh.robotAuthorizeAndReleaseMilestone(pid, 1e18, att, pqcPublicKey, pqcSig, sig, pre);
     }
 
@@ -225,40 +225,40 @@ contract BeeHabitatDAOAdvancedTest is BeeHabitatHarness {
         _releaseOn(fresh, pid, 1e18, otsChain[OTS_LEN - 1]);
         assertEq(fresh.getRobotOtsRemaining(), 0);
 
-        vm.warp(block.timestamp + 61 days);
+        vm.warp(vm.getBlockTimestamp() + 61 days);
         BeeHabitatDAO.MilestoneAttestation memory att = _goodAttestation();
         bytes memory pqcSig = _validPqcSignature();
         bytes32 pre = otsChain[OTS_LEN - 2];
         bytes memory sig = _mcuSignOn(fresh, pid, 1e18, att, pqcSig, pre, mcuPrivKey);
 
         vm.prank(ADMIN);
-        vm.expectRevert("PQC OTS chain exhausted");
+        vm.expectRevert(BeeHabitatDAO.OtsChainExhausted.selector);
         fresh.robotAuthorizeAndReleaseMilestone(pid, 1e18, att, pqcPublicKey, pqcSig, sig, pre);
     }
 
     /* ------------------ hardcoded mission rules at spend ------------------ */
 
     function test_EveryMissionRuleIsReEnforcedAtEveryRelease() public {
-        _assertRuleBlocks(_mutate(0), "Mission rule: site must be fully off-grid");
-        _assertRuleBlocks(_mutate(1), "Mission rule: solar generation required");
-        _assertRuleBlocks(_mutate(2), "Mission rule: battery storage required");
-        _assertRuleBlocks(_mutate(3), "Mission rule: atmospheric water generation required");
-        _assertRuleBlocks(_mutate(4), "Mission rule: free honey distribution required");
-        _assertRuleBlocks(_mutate(5), "Mission rule: indoor bee habitat hives required");
-        _assertRuleBlocks(_mutate(6), "Mission rule: land must be acquired/held");
-        _assertRuleBlocks(_mutate(7), "Mission rule: maintenance equipment must be operational");
-        _assertRuleBlocks(_mutate(8), "Mission rule: robot evidence bundle required");
+        _assertRuleBlocks(_mutate(0), BeeHabitatDAO.MissionRuleOffGridRequired.selector);
+        _assertRuleBlocks(_mutate(1), BeeHabitatDAO.MissionRuleSolarRequired.selector);
+        _assertRuleBlocks(_mutate(2), BeeHabitatDAO.MissionRuleBatteryRequired.selector);
+        _assertRuleBlocks(_mutate(3), BeeHabitatDAO.MissionRuleWaterRequired.selector);
+        _assertRuleBlocks(_mutate(4), BeeHabitatDAO.MissionRuleHoneyRequired.selector);
+        _assertRuleBlocks(_mutate(5), BeeHabitatDAO.MissionRuleHivesRequired.selector);
+        _assertRuleBlocks(_mutate(6), BeeHabitatDAO.MissionRuleLandRequired.selector);
+        _assertRuleBlocks(_mutate(7), BeeHabitatDAO.MissionRuleEquipmentRequired.selector);
+        _assertRuleBlocks(_mutate(8), BeeHabitatDAO.MissionRuleEvidenceRequired.selector);
     }
 
     /* --------------------------- anti-dump caps -------------------------- */
 
     function test_RevertIf_TrancheExceedsPerMilestoneCap() public {
         uint256 cap = dao.getProjectPerMilestoneCap(projectId);
-        _expectMilestoneRevert(cap + 1, "Exceeds per-milestone cap");
+        _expectMilestoneRevert(cap + 1, BeeHabitatDAO.ExceedsPerMilestoneCap.selector);
     }
 
     function test_FullFundingCannotBeDrainedInOneTransaction() public {
-        _expectMilestoneRevert(FUNDING, "Exceeds per-milestone cap");
+        _expectMilestoneRevert(FUNDING, BeeHabitatDAO.ExceedsPerMilestoneCap.selector);
     }
 
     /* ---------------------- authorisation surface ------------------------ */
@@ -270,20 +270,20 @@ contract BeeHabitatDAOAdvancedTest is BeeHabitatHarness {
         bytes memory sig = _mcuSign(projectId, 1e18, att, pqcSig, pre, mcuPrivKey);
 
         vm.prank(unauthorizedUser);
-        vm.expectRevert("Unauthorized: Must match hardware orchestrator");
+        vm.expectRevert(BeeHabitatDAO.Unauthorized.selector);
         dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, pqcSig, sig, pre);
     }
 
     /* ------------------------------ helpers ------------------------------ */
 
-    function _expectMilestoneRevert(uint256 amount, string memory reason) internal {
+    function _expectMilestoneRevert(uint256 amount, bytes4 expectedError) internal {
         BeeHabitatDAO.MilestoneAttestation memory att = _goodAttestation();
         bytes memory pqcSig = _validPqcSignature();
         bytes32 pre = otsChain[otsCursor];
         bytes memory sig = _mcuSign(projectId, amount, att, pqcSig, pre, mcuPrivKey);
 
         vm.prank(ADMIN);
-        vm.expectRevert(bytes(reason));
+        vm.expectRevert(expectedError);
         dao.robotAuthorizeAndReleaseMilestone(projectId, amount, att, pqcPublicKey, pqcSig, sig, pre);
     }
 
@@ -300,13 +300,13 @@ contract BeeHabitatDAOAdvancedTest is BeeHabitatHarness {
         else a.evidenceHash = bytes32(0);
     }
 
-    function _assertRuleBlocks(BeeHabitatDAO.MilestoneAttestation memory att, string memory reason) internal {
+    function _assertRuleBlocks(BeeHabitatDAO.MilestoneAttestation memory att, bytes4 expectedError) internal {
         bytes memory pqcSig = _validPqcSignature();
         bytes32 pre = otsChain[otsCursor];
         bytes memory sig = _mcuSign(projectId, 1e18, att, pqcSig, pre, mcuPrivKey);
 
         vm.prank(ADMIN);
-        vm.expectRevert(bytes(reason));
+        vm.expectRevert(expectedError);
         dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, pqcSig, sig, pre);
     }
 
@@ -334,7 +334,7 @@ contract BeeHabitatDAOAdvancedTest is BeeHabitatHarness {
         );
         vm.prank(daoMember2);
         d.vote(propId, true);
-        vm.warp(block.timestamp + 31 days);
+        vm.warp(vm.getBlockTimestamp() + 31 days);
         return d.executeProposal(propId);
     }
 
@@ -346,7 +346,7 @@ contract BeeHabitatDAOAdvancedTest is BeeHabitatHarness {
         bytes memory pqcSig,
         bytes32 pre,
         uint256 key
-    ) internal view returns (bytes memory) {
+    ) internal returns (bytes memory) {
         bytes32 actionDigest = keccak256(
             abi.encode(
                 d.MILESTONE_TYPEHASH(),

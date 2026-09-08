@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.28;
 
 import {BeeHabitatHarness, MockObsToken, SilentObsToken} from "./Harness.sol";
 import {BeeHabitatDAO} from "../contracts/BeeHabitatDAO.sol";
@@ -62,15 +62,15 @@ contract BeeHabitatDAOTest is BeeHabitatHarness {
 
     function test_RevertIf_UnauthorizedRobotSetup() public {
         vm.prank(unauthorizedUser);
-        vm.expectRevert("Unauthorized: Must match hardware orchestrator");
+        vm.expectRevert(BeeHabitatDAO.Unauthorized.selector);
         dao.setupRoomieRobotAndLock(pqcPublicKeyHash);
 
         vm.prank(unauthorizedUser);
-        vm.expectRevert("Unauthorized: Must match hardware orchestrator");
+        vm.expectRevert(BeeHabitatDAO.Unauthorized.selector);
         dao.commissionRoomieRobot(pqcPublicKeyHash, mcuSigner, otsChain[OTS_LEN], uint64(OTS_LEN));
 
         vm.prank(unauthorizedUser);
-        vm.expectRevert("Unauthorized: Must match hardware orchestrator");
+        vm.expectRevert(BeeHabitatDAO.Unauthorized.selector);
         dao.revokeAndUpdateImmutability();
     }
 
@@ -90,19 +90,19 @@ contract BeeHabitatDAOTest is BeeHabitatHarness {
 
     function test_RevertIf_CommissionWithZeroValues() public {
         vm.prank(ADMIN);
-        vm.expectRevert("Invalid PQC public key hash");
+        vm.expectRevert(BeeHabitatDAO.InvalidPqcPublicKeyHash.selector);
         dao.commissionRoomieRobot(bytes32(0), mcuSigner, otsChain[OTS_LEN], 1);
 
         vm.prank(ADMIN);
-        vm.expectRevert("Invalid MCU ECDSA signer");
+        vm.expectRevert(BeeHabitatDAO.InvalidMcuSigner.selector);
         dao.commissionRoomieRobot(pqcPublicKeyHash, address(0), otsChain[OTS_LEN], 1);
 
         vm.prank(ADMIN);
-        vm.expectRevert("Invalid PQC OTS chain tip");
+        vm.expectRevert(BeeHabitatDAO.InvalidOtsChainTip.selector);
         dao.commissionRoomieRobot(pqcPublicKeyHash, mcuSigner, bytes32(0), 1);
 
         vm.prank(ADMIN);
-        vm.expectRevert("Invalid PQC OTS chain length");
+        vm.expectRevert(BeeHabitatDAO.InvalidOtsChainLength.selector);
         dao.commissionRoomieRobot(pqcPublicKeyHash, mcuSigner, otsChain[OTS_LEN], 0);
     }
 
@@ -121,25 +121,25 @@ contract BeeHabitatDAOTest is BeeHabitatHarness {
 
         // Every configuration path is now permanently sealed - for the admin and for everyone.
         vm.prank(ADMIN);
-        vm.expectRevert("Robot configuration is permanently immutable");
+        vm.expectRevert(BeeHabitatDAO.ConfigurationImmutable.selector);
         dao.setupRoomieRobotAndLock(keccak256("x"));
 
         vm.prank(ADMIN);
-        vm.expectRevert("Robot configuration is permanently immutable");
+        vm.expectRevert(BeeHabitatDAO.ConfigurationImmutable.selector);
         dao.updateRobotPqcPublicKey(keccak256("x"));
 
         vm.prank(ADMIN);
-        vm.expectRevert("Robot configuration is permanently immutable");
+        vm.expectRevert(BeeHabitatDAO.ConfigurationImmutable.selector);
         dao.commissionRoomieRobot(keccak256("x"), unauthorizedUser, keccak256("y"), 10);
 
         vm.prank(ADMIN);
-        vm.expectRevert("Robot configuration is permanently immutable");
+        vm.expectRevert(BeeHabitatDAO.ConfigurationImmutable.selector);
         dao.revokeAndUpdateImmutability();
     }
 
     function test_RevertIf_UpdateKeyBeforeProvisioning() public {
         vm.prank(ADMIN);
-        vm.expectRevert("Robot not yet configured");
+        vm.expectRevert(BeeHabitatDAO.RobotNotProvisioned.selector);
         dao.updateRobotPqcPublicKey(keccak256("x"));
     }
 
@@ -154,19 +154,19 @@ contract BeeHabitatDAOTest is BeeHabitatHarness {
 
         // The 100 LP/month ceiling is cumulative, not per call.
         vm.prank(ADMIN);
-        vm.expectRevert("Exceeds monthly issuance limit");
+        vm.expectRevert(BeeHabitatDAO.ExceedsMonthlyIssuanceLimit.selector);
         dao.issueMonthlyLpTokens(daoMember, 1);
     }
 
     function test_RevertIf_SingleIssuanceExceedsMonthlyCap() public {
         vm.prank(ADMIN);
-        vm.expectRevert("Exceeds monthly issuance limit");
+        vm.expectRevert(BeeHabitatDAO.ExceedsMonthlyIssuanceLimit.selector);
         dao.issueMonthlyLpTokens(daoMember, 101 * 1e18);
     }
 
     function test_RevertIf_UnauthorizedIssuesLp() public {
         vm.prank(unauthorizedUser);
-        vm.expectRevert("Unauthorized: Must match hardware orchestrator");
+        vm.expectRevert(BeeHabitatDAO.Unauthorized.selector);
         dao.issueMonthlyLpTokens(daoMember, 1e18);
     }
 
@@ -174,7 +174,7 @@ contract BeeHabitatDAOTest is BeeHabitatHarness {
         _issueLp(daoMember, 100 * 1e18);
         assertEq(dao.getVotingPower(daoMember), 100 * 1e18);
 
-        vm.warp(block.timestamp + 30 days);
+        vm.warp(vm.getBlockTimestamp() + 30 days);
         assertEq(dao.getVotingPower(daoMember), 0);
 
         // A fresh month grants a fresh 100 - the expired LP is gone, never carried forward.
@@ -187,7 +187,7 @@ contract BeeHabitatDAOTest is BeeHabitatHarness {
         _issueLp(daoMember2, 100 * 1e18);
         assertEq(dao.getTotalActiveLpSupply(), 200 * 1e18);
 
-        vm.warp(block.timestamp + 31 days);
+        vm.warp(vm.getBlockTimestamp() + 31 days);
         assertEq(dao.getTotalActiveLpSupply(), 0);
     }
 
@@ -197,7 +197,7 @@ contract BeeHabitatDAOTest is BeeHabitatHarness {
         assertEq(dao.getVotingPower(daoMember), 100 * 1e18);
         assertEq(dao.getVotingPower(daoMember2), 75 * 1e18);
 
-        vm.warp(block.timestamp + 31 days);
+        vm.warp(vm.getBlockTimestamp() + 31 days);
         assertEq(dao.getVotingPower(daoMember), 0);
         assertEq(dao.getVotingPower(daoMember2), 0);
     }
@@ -207,7 +207,7 @@ contract BeeHabitatDAOTest is BeeHabitatHarness {
     function test_ProposalRequires50LpThreshold() public {
         _issueLp(daoMember, 49 * 1e18);
         vm.prank(daoMember);
-        vm.expectRevert("Insufficient unexpired LP tokens (50 required)");
+        vm.expectRevert(BeeHabitatDAO.InsufficientLpToPropose.selector);
         dao.createOffGridBeeHabitatProposal("x", 25, 100, 1e18, habitatOperator, true, true, true, true, true);
 
         _issueLp(daoMember, 1e18); // now exactly 50
@@ -218,9 +218,9 @@ contract BeeHabitatDAOTest is BeeHabitatHarness {
 
     function test_ExpiredLpCannotPropose() public {
         _issueLp(daoMember, 100 * 1e18);
-        vm.warp(block.timestamp + 31 days);
+        vm.warp(vm.getBlockTimestamp() + 31 days);
         vm.prank(daoMember);
-        vm.expectRevert("Insufficient unexpired LP tokens (50 required)");
+        vm.expectRevert(BeeHabitatDAO.InsufficientLpToPropose.selector);
         dao.createOffGridBeeHabitatProposal("x", 25, 100, 1e18, habitatOperator, true, true, true, true, true);
     }
 
@@ -228,31 +228,31 @@ contract BeeHabitatDAOTest is BeeHabitatHarness {
         _issueLp(daoMember, 100 * 1e18);
         vm.startPrank(daoMember);
 
-        vm.expectRevert("Must meet minimum bee forage acreage mandate");
+        vm.expectRevert(BeeHabitatDAO.BelowMinimumAcreage.selector);
         dao.createOffGridBeeHabitatProposal("x", 19, 100, 1e18, habitatOperator, true, true, true, true, true);
 
-        vm.expectRevert("Exceeds optimal safe carrying capacity index cap");
+        vm.expectRevert(BeeHabitatDAO.ExceedsBeeIndexCap.selector);
         dao.createOffGridBeeHabitatProposal("x", 25, 500_001, 1e18, habitatOperator, true, true, true, true, true);
 
-        vm.expectRevert("Off-grid habitats must feature solar and battery storage");
+        vm.expectRevert(BeeHabitatDAO.SolarAndBatteryRequired.selector);
         dao.createOffGridBeeHabitatProposal("x", 25, 100, 1e18, habitatOperator, false, true, true, true, true);
 
-        vm.expectRevert("Off-grid habitats must feature atmospheric water generation");
+        vm.expectRevert(BeeHabitatDAO.AtmosphericWaterRequired.selector);
         dao.createOffGridBeeHabitatProposal("x", 25, 100, 1e18, habitatOperator, true, false, true, true, true);
 
-        vm.expectRevert("Must include land acquisition for permanent habitat");
+        vm.expectRevert(BeeHabitatDAO.LandAcquisitionRequired.selector);
         dao.createOffGridBeeHabitatProposal("x", 25, 100, 1e18, habitatOperator, true, true, false, true, true);
 
-        vm.expectRevert("Must include equipment for maintenance operations");
+        vm.expectRevert(BeeHabitatDAO.EquipmentAcquisitionRequired.selector);
         dao.createOffGridBeeHabitatProposal("x", 25, 100, 1e18, habitatOperator, true, true, true, false, true);
 
-        vm.expectRevert("Must include honey production and free distribution");
+        vm.expectRevert(BeeHabitatDAO.HoneyDistributionRequired.selector);
         dao.createOffGridBeeHabitatProposal("x", 25, 100, 1e18, habitatOperator, true, true, true, true, false);
 
-        vm.expectRevert("Requested funding required");
+        vm.expectRevert(BeeHabitatDAO.FundingRequired.selector);
         dao.createOffGridBeeHabitatProposal("x", 25, 100, 0, habitatOperator, true, true, true, true, true);
 
-        vm.expectRevert("Invalid payout recipient");
+        vm.expectRevert(BeeHabitatDAO.InvalidRecipient.selector);
         dao.createOffGridBeeHabitatProposal("x", 25, 100, 1e18, address(0), true, true, true, true, true);
 
         vm.stopPrank();
@@ -319,22 +319,22 @@ contract BeeHabitatDAOTest is BeeHabitatHarness {
         vm.prank(daoMember);
         dao.vote(id, true);
         vm.prank(daoMember);
-        vm.expectRevert("Already voted");
+        vm.expectRevert(BeeHabitatDAO.AlreadyVoted.selector);
         dao.vote(id, true);
     }
 
     function test_CannotVoteWithoutLp() public {
         uint256 id = _openProposal();
         vm.prank(unauthorizedUser);
-        vm.expectRevert("No active unexpired LP voting power");
+        vm.expectRevert(BeeHabitatDAO.NoVotingPower.selector);
         dao.vote(id, true);
     }
 
     function test_ExpiredLpCannotVote() public {
         uint256 id = _openProposal();
-        vm.warp(block.timestamp + 31 days);
+        vm.warp(vm.getBlockTimestamp() + 31 days);
         vm.prank(daoMember);
-        vm.expectRevert("Voting inactive");
+        vm.expectRevert(BeeHabitatDAO.VotingInactive.selector);
         dao.vote(id, true);
     }
 
@@ -342,14 +342,14 @@ contract BeeHabitatDAOTest is BeeHabitatHarness {
         uint256 id = _openProposal();
         vm.warp(dao.getProposalEndTime(id) + 1);
         vm.prank(daoMember);
-        vm.expectRevert("Voting inactive");
+        vm.expectRevert(BeeHabitatDAO.VotingInactive.selector);
         dao.vote(id, true);
     }
 
     function test_CannotVoteOnNonExistentProposal() public {
         _issueLp(daoMember, 100 * 1e18);
         vm.prank(daoMember);
-        vm.expectRevert("Proposal does not exist");
+        vm.expectRevert(BeeHabitatDAO.ProposalNotFound.selector);
         dao.vote(999, true);
     }
 
@@ -372,7 +372,7 @@ contract BeeHabitatDAOTest is BeeHabitatHarness {
         assertEq(credited, 500 * 1e18);
         assertEq(dao.totalObsVaultBalance(), 500 * 1e18);
 
-        vm.expectRevert("Nothing to sync");
+        vm.expectRevert(BeeHabitatDAO.NothingToSync.selector);
         dao.syncVault();
     }
 
@@ -386,7 +386,7 @@ contract BeeHabitatDAOTest is BeeHabitatHarness {
 
     function test_RevertIf_UnlockBelowFiveBillionDai() public {
         obs.setDaiReserve(5_000_000_000 * 1e18 - 1);
-        vm.expectRevert("Target of 5 Billion DAI not reached");
+        vm.expectRevert(BeeHabitatDAO.BondingCurveTargetNotReached.selector);
         dao.checkAndUnlockVault();
         assertFalse(dao.isVaultUnlocked());
     }
@@ -396,7 +396,7 @@ contract BeeHabitatDAOTest is BeeHabitatHarness {
         dao.checkAndUnlockVault();
         assertTrue(dao.isVaultUnlocked());
 
-        vm.expectRevert("Vault already unlocked");
+        vm.expectRevert(BeeHabitatDAO.VaultAlreadyUnlocked.selector);
         dao.checkAndUnlockVault();
     }
 
@@ -405,11 +405,11 @@ contract BeeHabitatDAOTest is BeeHabitatHarness {
         // and no oracle. Even the admin cannot unlock an under-funded curve.
         obs.setDaiReserve(0);
         vm.prank(ADMIN);
-        vm.expectRevert("Target of 5 Billion DAI not reached");
+        vm.expectRevert(BeeHabitatDAO.BondingCurveTargetNotReached.selector);
         dao.checkAndUnlockVault();
 
         vm.prank(unauthorizedUser);
-        vm.expectRevert("Target of 5 Billion DAI not reached");
+        vm.expectRevert(BeeHabitatDAO.BondingCurveTargetNotReached.selector);
         dao.checkAndUnlockVault();
     }
 
@@ -417,7 +417,7 @@ contract BeeHabitatDAOTest is BeeHabitatHarness {
         SilentObsToken silent = new SilentObsToken();
         vm.etch(OBS_TOKEN, address(silent).code);
         assertEq(dao.bondingCurveDaiReserves(), 0);
-        vm.expectRevert("Target of 5 Billion DAI not reached");
+        vm.expectRevert(BeeHabitatDAO.BondingCurveTargetNotReached.selector);
         dao.checkAndUnlockVault();
     }
 

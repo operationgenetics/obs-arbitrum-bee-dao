@@ -1,154 +1,253 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.28;
 
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /**
- * @title BeeHabitatDAO
- * @notice Fully off-grid, zero-config DAO + vault for the Obscura (OBS) ecosystem on Arbitrum One.
+ * @title  BeeHabitatDAO
+ * @notice Immutable, zero-configuration DAO and OBS vault for the Obscura ecosystem on
+ *         Arbitrum One, funding off-grid indoor bee habitats.
+ * @dev    Deployed with no constructor arguments, no initializer, no proxy, no owner, no pause
+ *         switch and no upgrade path. Every address and parameter is a compile-time `constant`.
  *
- * DESIGN INVARIANTS (all hardcoded, no constructor arguments, no proxy, no owner, no pause):
- *  - Vault holds OBS. Nothing can leave the vault until the OBS bonding curve has genuinely
- *    collected 5,000,000,000 DAI, read TRUSTLESSLY from the OBS token itself. No oracle, no
- *    caller-supplied number, no off-chain feed. Fully off-grid.
- *  - Spending is gated behind a hybrid post-quantum credential physically held on the Roomie
- *    humanoid robot's PQC MCU. Biometric templates NEVER touch the chain - only the public
- *    commitment does.
- *  - Funds are mathematically time-released across the whole life of a project (>= 6 tranches,
- *    one per 60 days, each capped as a fraction of the vault) so a project cannot be drained in
- *    one transaction and the OBS price cannot be crashed by the DAO itself.
- *  - Every tranche requires an on-chain, robot-signed attestation that the hardcoded mission
- *    rules are actually being executed in the real world.
- *  - The robot configuration is updatable exactly until the config authority signs
- *    `revokeAndUpdateImmutability()`. After that the contract is permanently, irreversibly frozen
- *    in configuration: no key can ever be changed, added or rotated again by anyone.
+ *         Security model, in order of precedence:
+ *
+ *         1. NOTHING leaves the vault until the OBS bonding curve has genuinely collected
+ *            5,000,000,000 DAI, read trustlessly from the OBS token itself. There is no oracle,
+ *            no relayer and no caller-supplied figure anywhere in the unlock path.
+ *         2. The single outbound transfer in this contract lives in
+ *            {robotAuthorizeAndReleaseMilestone} and pays only the recipient the DAO voted on.
+ *         3. That release requires a hybrid post-quantum authorization from the Roomie humanoid
+ *            robot's PQC MCU. Biometric templates never touch the chain; only public
+ *            commitments do. See {_verifyHybridPqcAuthorization}.
+ *         4. Releases are mathematically time-locked into at least six 60-day tranches, each
+ *            capped as a fraction of the vault, so the treasury cannot be drained quickly.
+ *         5. The hardcoded mission rules are re-enforced on chain at every single release
+ *            against a robot-signed real-world attestation, and again at project completion.
+ *
+ *         Checks-Effects-Interactions is observed throughout; the one external token call is
+ *         made last and is additionally protected by {ReentrancyGuard}.
+ *
+ * @custom:security-contact operationgenetics@proton.me
  */
 contract BeeHabitatDAO is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    /* ------------------------------------------------------------------ */
-    /*                      IMMUTABLE ON-CHAIN WIRING                      */
-    /* ------------------------------------------------------------------ */
+    /* ====================================================================== */
+    /*                                 ERRORS                                 */
+    /* ====================================================================== */
+
+    /// @dev Caller is not the hardcoded orchestrator wallet.
+    error Unauthorized();
+    /// @dev Robot configuration has been permanently frozen by {revokeAndUpdateImmutability}.
+    error ConfigurationImmutable();
+    error InvalidPqcPublicKeyHash();
+    error InvalidMcuSigner();
+    error InvalidOtsChainTip();
+    error InvalidOtsChainLength();
+    error RobotNotProvisioned();
+    error RobotNotCommissioned();
+    error PqcPublicKeyTooShort();
+    error PqcPublicKeyMismatch();
+    error OtsChainExhausted();
+    error InvalidOtsPreimage();
+    error PqcSignatureTooShort();
+    error InvalidEcdsaSignatureLength();
+    error InvalidEcdsaSignatureV();
+    error MalleableEcdsaSignature();
+    error InvalidEcdsaSignature();
+    error EcdsaSignerMismatch();
+
+    error VaultAlreadyUnlocked();
+    /// @dev The OBS bonding curve has not yet collected {BONDING_CURVE_DAI_UNLOCK_TARGET} DAI.
+    error BondingCurveTargetNotReached();
+    error VaultLocked();
+    error NothingToDeposit();
+    error NothingToSync();
+    error InsufficientVaultBalance();
+
+    error InvalidRecipient();
+    error NothingToIssue();
+    error ExceedsMonthlyIssuanceLimit();
+
+    error InsufficientLpToPropose();
+    error DescriptionRequired();
+    error FundingRequired();
+    error BelowMinimumAcreage();
+    error ExceedsBeeIndexCap();
+    error SolarAndBatteryRequired();
+    error AtmosphericWaterRequired();
+    error LandAcquisitionRequired();
+    error EquipmentAcquisitionRequired();
+    error HoneyDistributionRequired();
+
+    error ProposalNotFound();
+    error VotingInactive();
+    error AlreadyVoted();
+    error NoVotingPower();
+    error VotingNotEnded();
+    error ProposalAlreadyExecuted();
+    error NoVotesCast();
+    error ProposalRejected();
+    error QuorumNotReached();
+    error ExceedsMaxProjectShare();
+    error VaultTooSmallForSchedule();
+    error ExceedsScheduleLimit();
+
+    error ProjectNotFound();
+    error ProjectAlreadyCompleted();
+    error ProjectHasExpired();
+    error ProjectAlreadyExpired();
+    error ProjectDeadlinePassed();
+    error ProjectDeadlineNotReached();
+    error AllMilestonesCompleted();
+    error MilestonesIncomplete();
+    /// @dev Only one robot authorization per project per {MILESTONE_GATING_INTERVAL}.
+    error MilestoneLocked();
+    error NothingToRelease();
+    error ExceedsPerMilestoneCap();
+    error ExceedsRemainingFunding();
+    error ExceedsTrancheCap();
+
+    error MissionRuleOffGridRequired();
+    error MissionRuleSolarRequired();
+    error MissionRuleBatteryRequired();
+    error MissionRuleWaterRequired();
+    error MissionRuleHoneyRequired();
+    error MissionRuleHivesRequired();
+    error MissionRuleLandRequired();
+    error MissionRuleEquipmentRequired();
+    error MissionRuleEvidenceRequired();
+    error MissionOutcomeNotMet();
+
+    /* ====================================================================== */
+    /*                        IMMUTABLE ON-CHAIN WIRING                       */
+    /* ====================================================================== */
 
     /// @notice Obscura (OBS) on Arbitrum One. Verified: name "Obscura", symbol "OBS", 18 decimals.
     address public constant OBS_TOKEN = 0xa473BdD164F992717Bdbd5F7e10F168C7Ad5D7B0;
 
-    /// @notice The ONLY wallet that may provision / rotate / freeze the Roomie robot credential
-    ///         and drive operations. Hardcoded, cannot be transferred, cannot be renounced.
+    /// @notice The only wallet that may provision, rotate or freeze the Roomie robot credential
+    ///         and drive operations. Hardcoded; it cannot be transferred or renounced.
     address public constant ADMIN_ORCHESTRATOR = 0xaF570ce3b32D765b1236635B0f541a7487A1fB8e;
 
     /// @notice 5 billion DAI (18 decimals) of real bonding-curve reserves unlocks the vault.
     uint256 public constant BONDING_CURVE_DAI_UNLOCK_TARGET = 5_000_000_000 * 1e18;
 
-    /// @dev `daiReserve()` on the OBS token - the live bonding-curve reserve.
+    /// @dev `daiReserve()` on the OBS token: the live bonding-curve reserve.
     bytes4 private constant SEL_DAI_RESERVE = 0xe2771ec8;
-    /// @dev `totalDaiCollected()` on the OBS token - cumulative DAI taken in by the curve.
+    /// @dev `totalDaiCollected()` on the OBS token: cumulative DAI taken in by the curve.
     bytes4 private constant SEL_TOTAL_DAI_COLLECTED = 0x57d0e873;
 
-    /* ------------------------------------------------------------------ */
-    /*                    HARDCODED MISSION RULES (ROBOTS)                 */
-    /* ------------------------------------------------------------------ */
+    /* ====================================================================== */
+    /*                      HARDCODED MISSION PARAMETERS                      */
+    /* ====================================================================== */
 
+    /// @notice Geographic mandate for every funded habitat.
     string public constant HABITAT_FOCUS_ZONE =
         "Nationwide United States Off-Grid Indoor & Regional Pollinator Corridors";
 
+    /// @notice The mission the robots are bound to. Enforced by code, not convention.
     string public constant MISSION_MANDATE =
         "Off-grid indoor bee habitats with atmospheric water generation, solar generation and "
         "battery storage; honey farmed and given away free; land and equipment acquired and "
         "maintained indefinitely until the optimal bee flourishing index is reached.";
 
+    /// @notice Minimum flowering acreage any funded habitat must forage.
     uint256 public constant MIN_FLOWERING_ACRES_TARGET = 20;
+    /// @notice Safe carrying-capacity ceiling for the bee population index.
     uint256 public constant OPTIMAL_BEE_INDEX_CAP = 500_000;
-    /// @notice Global flourishing target. Operations continue indefinitely until this is met.
+    /// @notice Global flourishing target. Operations continue indefinitely until it is met.
     uint256 public constant TARGET_BEE_FLOURISHING_INDEX = 500_000;
 
-    /* ------------------------------------------------------------------ */
-    /*                   HARDCODED GOVERNANCE PARAMETERS                   */
-    /* ------------------------------------------------------------------ */
+    /* ====================================================================== */
+    /*                     HARDCODED GOVERNANCE PARAMETERS                    */
+    /* ====================================================================== */
 
-    uint256 public constant MONTHLY_LP_ISSUANCE = 100 * 1e18; // 100 LP per member per month
-    uint256 public constant PROPOSAL_THRESHOLD = 50 * 1e18;   // 50 LP to open a proposal
+    /// @notice 100 LP per member per month, cumulative across all issuances in that month.
+    uint256 public constant MONTHLY_LP_ISSUANCE = 100 * 1e18;
+    /// @notice 50 unexpired LP are required to open a proposal.
+    uint256 public constant PROPOSAL_THRESHOLD = 50 * 1e18;
     uint256 public constant VOTING_PERIOD_DURATION = 30 days;
-    uint256 public constant LP_EPOCH = 30 days;               // LP expires at the epoch boundary
-    uint256 public constant MILESTONE_GATING_INTERVAL = 60 days; // robot authorises 1x / 2 months
-    uint256 public constant QUORUM_PERCENTAGE = 10;           // 10% of the month's live LP supply
+    /// @notice LP expires at the end of each epoch and is never carried forward.
+    uint256 public constant LP_EPOCH = 30 days;
+    /// @notice The robot may authorize a given project once every 60 days.
+    uint256 public constant MILESTONE_GATING_INTERVAL = 60 days;
+    /// @notice Percentage of the epoch's live LP supply that must vote for a proposal to pass.
+    uint256 public constant QUORUM_PERCENTAGE = 10;
 
-    /* ------------------------------------------------------------------ */
-    /*                 HARDCODED ANTI-DUMP / TIME-LOCK RULES               */
-    /* ------------------------------------------------------------------ */
+    /* ====================================================================== */
+    /*                   HARDCODED ANTI-DUMP / TIME-LOCK RULES                */
+    /* ====================================================================== */
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
     /// @notice No single project may reserve more than 20% of the unreserved vault.
     uint256 public constant MAX_PROJECT_BPS_OF_VAULT = 2_000;
-    /// @notice No single 60-day tranche may exceed 2.5% of the vault balance at release time.
+    /// @notice No single 60-day tranche may exceed 2.5% of the vault balance at approval time.
     uint256 public constant MAX_TRANCHE_BPS_OF_VAULT = 250;
-    /// @notice Every project is stretched over at least 6 tranches => at least 12 months.
+    /// @notice Every project is stretched over at least six tranches, so at least twelve months.
     uint32 public constant MIN_PROJECT_MILESTONES = 6;
     uint32 public constant MAX_PROJECT_MILESTONES = 120;
     uint256 public constant PROJECT_GRACE_PERIOD = 90 days;
 
-    /* ------------------------------------------------------------------ */
-    /*                     HYBRID PQC CREDENTIAL RULES                     */
-    /* ------------------------------------------------------------------ */
+    /* ====================================================================== */
+    /*                      HYBRID PQC CREDENTIAL RULES                       */
+    /* ====================================================================== */
 
-    /// @dev Rejects classically-sized signatures masquerading as PQC.
-    ///      Falcon-512 = 666 B, ML-DSA-44 = 2420 B, SPHINCS+-128s = 7856 B.
+    /// @notice Minimum PQC signature size, chosen to reject classically-sized signatures.
+    /// @dev Falcon-512 is 666 bytes, ML-DSA-44 is 2420, SPHINCS+-128s is 7856.
     uint256 public constant MIN_PQC_SIGNATURE_BYTES = 512;
+    /// @notice Minimum PQC public key size. SPHINCS+ public keys are only 32 bytes.
     uint256 public constant MIN_PQC_PUBLIC_KEY_BYTES = 32;
 
-    bytes32 public constant MILESTONE_TYPEHASH =
-        keccak256("RoomieMilestoneAuthorization(uint256 projectId,uint32 milestoneIndex,uint256 amount,address recipient,bytes32 attestationHash)");
+    /// @dev secp256k1 group order halved; signatures above this are malleable and rejected.
+    uint256 private constant SECP256K1_HALF_N =
+        0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
 
-    /* ------------------------------------------------------------------ */
-    /*                               STORAGE                               */
-    /* ------------------------------------------------------------------ */
+    /// @notice Domain separator for a milestone authorization signed by the Roomie MCU.
+    bytes32 public constant MILESTONE_TYPEHASH = keccak256(
+        "RoomieMilestoneAuthorization(uint256 projectId,uint32 milestoneIndex,uint256 amount,address recipient,bytes32 attestationHash)"
+    );
+
+    /* ====================================================================== */
+    /*                                 TYPES                                  */
+    /* ====================================================================== */
 
     /**
      * @notice The Roomie humanoid robot's hybrid post-quantum credential.
-     * @dev Biometric templates are hard-locked inside the MCU secure element and are NEVER
+     * @dev Biometric templates are hard-locked inside the MCU secure element and are never
      *      written on chain. Only public commitments live here.
      *
-     *      Hybrid = an attacker must break BOTH legs:
-     *        - classical leg : secp256k1 ECDSA from the MCU's classical key.
-     *        - quantum leg   : keccak256 pre-image resistance (PQC public key commitment +
-     *                          a one-time-signature hash chain). Immune to Shor's algorithm.
+     *      Hybrid means an attacker must break both legs, not either one:
+     *        - classical leg: secp256k1 ECDSA from the MCU's classical key;
+     *        - quantum leg:   keccak256 pre-image resistance, via the PQC public-key commitment
+     *          and a one-time-signature hash chain. Neither is broken by Shor's algorithm.
+     *
+     * @param pqcPublicKeyHash keccak256 of the full PQC public key stored on the MCU.
+     * @param mcuEcdsaSigner   secp256k1 address derived inside the MCU secure element.
+     * @param otsChainTip      Current tip of the MCU's one-time-signature hash chain.
+     * @param otsRemaining     Authorizations the chain can still serve.
+     * @param provisioned      Day-one provisional setup has been done.
+     * @param commissioned     Real hardware is bound, so spending is cryptographically possible.
      */
     struct RobotCredential {
-        bytes32 pqcPublicKeyHash;  // keccak256(full PQC public key stored on the MCU)
-        address mcuEcdsaSigner;    // classical secp256k1 leg, also sealed in the MCU
-        bytes32 otsChainTip;       // post-quantum one-time-signature (hash chain) tip
-        uint64 otsRemaining;       // authorisations left in the chain
-        bool provisioned;          // day-one provisional setup done
-        bool commissioned;         // real hardware landed; spending is possible
+        bytes32 pqcPublicKeyHash;
+        address mcuEcdsaSigner;
+        bytes32 otsChainTip;
+        uint64 otsRemaining;
+        bool provisioned;
+        bool commissioned;
     }
 
-    RobotCredential public robot;
-
-    /// @notice False once `revokeAndUpdateImmutability()` is signed. Never returns to true.
-    bool public canUpdateRobotConfig = true;
-
-    /// @notice Set by `checkAndUnlockVault()` once the OBS curve truly holds 5B DAI. One-way.
-    bool public vaultUnlocked;
-
-    uint256 public totalObsVaultBalance;
-    uint256 public totalReservedForProjects;
-    uint256 public totalObsReleased;
-
-    /// @notice Cumulative, robot-attested bee flourishing index across all projects.
-    uint256 public beeFlourishingIndex;
-    bool public optimalBeeFlourishingReached;
-
+    /// @notice A member's expiring LP position for a single epoch.
     struct LpTokenLedger {
         uint256 balance;
-        uint256 epoch; // LP_EPOCH index in which this balance was issued
+        uint256 epoch;
     }
 
-    mapping(address => LpTokenLedger) public monthlyLpBalances;
-    /// @notice Live LP issued per epoch - the denominator for quorum.
-    mapping(uint256 => uint256) public lpSupplyByEpoch;
-
+    /// @notice A mission-constrained funding proposal.
     struct OffGridHabitatProposal {
         uint256 id;
         address proposer;
@@ -168,13 +267,10 @@ contract BeeHabitatDAO is ReentrancyGuard {
         uint256 endTime;
         uint256 startEpoch;
         bool executed;
-        bool canceled;
         mapping(address => bool) hasVoted;
     }
 
-    mapping(uint256 => OffGridHabitatProposal) internal proposals;
-    uint256 public proposalCount;
-
+    /// @notice An approved project and its mathematically derived release schedule.
     struct Project {
         uint256 id;
         uint256 proposalId;
@@ -194,7 +290,7 @@ contract BeeHabitatDAO is ReentrancyGuard {
         string missionDescription;
     }
 
-    /// @notice Cumulative real-world delivery, attested by the robot at every tranche.
+    /// @notice Cumulative real-world delivery for a project, attested at every tranche.
     struct MissionLedger {
         uint256 acresSecured;
         uint256 hivesInstalled;
@@ -205,6 +301,7 @@ contract BeeHabitatDAO is ReentrancyGuard {
     }
 
     /// @notice One tranche's worth of robot-verified, real-world evidence.
+    /// @dev Every field is bound into the signed digest; changing any byte invalidates it.
     struct MilestoneAttestation {
         uint256 acresSecured;
         uint256 hivesInstalled;
@@ -213,24 +310,67 @@ contract BeeHabitatDAO is ReentrancyGuard {
         uint256 solarKwhGenerated;
         uint256 batteryKwhStored;
         uint256 beeFlourishingIndexDelta;
-        bool offGridVerified;      // zero grid interconnection at the site
-        bool landAcquired;         // land acquisition executed / held
-        bool equipmentOperational; // maintenance equipment on site and running
-        bytes32 evidenceHash;      // hash of the robot's sensor/photo evidence bundle
+        bool offGridVerified;
+        bool landAcquired;
+        bool equipmentOperational;
+        bytes32 evidenceHash;
     }
 
-    mapping(uint256 => Project) internal projects;
-    mapping(uint256 => MissionLedger) internal missionLedgers;
+    /* ====================================================================== */
+    /*                                STORAGE                                 */
+    /* ====================================================================== */
+
+    /// @notice The bound Roomie robot credential.
+    RobotCredential public robot;
+
+    /// @notice False once {revokeAndUpdateImmutability} is signed. It never returns to true.
+    bool public canUpdateRobotConfig = true;
+
+    /// @notice Set once by {checkAndUnlockVault}. One-way; it can never be unset.
+    bool public vaultUnlocked;
+
+    /// @notice OBS credited to the vault.
+    uint256 public totalObsVaultBalance;
+    /// @notice OBS committed to live projects and therefore unavailable to new ones.
+    uint256 public totalReservedForProjects;
+    /// @notice OBS released to habitat operators to date.
+    uint256 public totalObsReleased;
+
+    /// @notice Cumulative, robot-attested bee flourishing index across all projects.
+    uint256 public beeFlourishingIndex;
+    /// @notice True once {beeFlourishingIndex} reaches {TARGET_BEE_FLOURISHING_INDEX}.
+    bool public optimalBeeFlourishingReached;
+
+    mapping(address account => LpTokenLedger ledger) public monthlyLpBalances;
+    /// @notice Live LP issued per epoch. This is the quorum denominator.
+    mapping(uint256 epoch => uint256 supply) public lpSupplyByEpoch;
+
+    mapping(uint256 proposalId => OffGridHabitatProposal proposal) private _proposals;
+    uint256 public proposalCount;
+
+    mapping(uint256 projectId => Project project) private _projects;
+    mapping(uint256 projectId => MissionLedger ledger) private _missionLedgers;
     uint256 public projectCount;
 
-    /* ------------------------------------------------------------------ */
-    /*                               EVENTS                                */
-    /* ------------------------------------------------------------------ */
+    /* ====================================================================== */
+    /*                                 EVENTS                                 */
+    /* ====================================================================== */
 
-    event RoomieRobotProvisioned(bytes32 pqcPublicKeyHash);
-    event RoomieRobotCommissioned(bytes32 pqcPublicKeyHash, address mcuEcdsaSigner, bytes32 otsChainTip, uint64 otsChainLength);
-    event RoomieRobotConfigured(bytes32 pqcPublicKeyHash);
+    event RoomieRobotProvisioned(bytes32 indexed pqcPublicKeyHash);
+    event RoomieRobotCommissioned(
+        bytes32 indexed pqcPublicKeyHash,
+        address indexed mcuEcdsaSigner,
+        bytes32 otsChainTip,
+        uint64 otsChainLength
+    );
+    event RoomieRobotConfigured(bytes32 indexed pqcPublicKeyHash);
     event RobotConfigRevoked();
+
+    event VaultUnlockedByBondingCurve(uint256 daiReserves);
+    event VaultDeposit(address indexed from, uint256 amount);
+    event VaultSynced(uint256 credited, uint256 newBalance);
+
+    event LpTokensIssued(address indexed recipient, uint256 amount, uint256 indexed epoch);
     event OffGridBeeHabitatProposalCreated(
         uint256 indexed proposalId,
         address indexed proposer,
@@ -240,116 +380,141 @@ contract BeeHabitatDAO is ReentrancyGuard {
         uint256 requestedFunding,
         address payoutRecipient
     );
-    event LpTokensIssued(address indexed recipient, uint256 amount, uint256 indexed epoch);
     event Voted(uint256 indexed proposalId, address indexed voter, uint256 weight, bool support);
-    event VaultUnlockedByBondingCurve(uint256 daiReserves);
-    event VaultDeposit(address indexed from, uint256 amount);
-    event VaultSynced(uint256 credited, uint256 newBalance);
-    event ProjectCreated(uint256 indexed projectId, uint256 indexed proposalId, address indexed creator, uint256 fundingAmount, uint32 milestoneCount, uint256 perMilestoneCap, uint256 deadline);
-    event MilestoneAuthorizedByRobot(uint256 indexed projectId, uint32 indexed milestoneIndex, uint256 amount, bytes32 pqcSignatureHash, bytes32 evidenceHash, uint256 timestamp);
-    event ProjectFundsWithdrawn(uint256 indexed projectId, uint256 amount, address recipient);
+
+    event ProjectCreated(
+        uint256 indexed projectId,
+        uint256 indexed proposalId,
+        address indexed creator,
+        uint256 fundingAmount,
+        uint32 milestoneCount,
+        uint256 perMilestoneCap,
+        uint256 deadline
+    );
+    event MilestoneAuthorizedByRobot(
+        uint256 indexed projectId,
+        uint32 indexed milestoneIndex,
+        uint256 amount,
+        bytes32 pqcSignatureHash,
+        bytes32 evidenceHash,
+        uint256 timestamp
+    );
+    event ProjectFundsWithdrawn(uint256 indexed projectId, uint256 amount, address indexed recipient);
     event ProjectCompleted(uint256 indexed projectId);
     event ProjectExpired(uint256 indexed projectId, uint256 fundsReturnedToVault);
+
     event BeeFlourishingIndexUpdated(uint256 newIndex);
     event OptimalBeeFlourishingReached(uint256 index, uint256 timestamp);
 
-    /* ------------------------------------------------------------------ */
-    /*                              MODIFIERS                              */
-    /* ------------------------------------------------------------------ */
+    /* ====================================================================== */
+    /*                               MODIFIERS                                */
+    /* ====================================================================== */
 
     modifier onlyAdminOrRobot() {
-        require(msg.sender == ADMIN_ORCHESTRATOR, "Unauthorized: Must match hardware orchestrator");
+        if (msg.sender != ADMIN_ORCHESTRATOR) revert Unauthorized();
         _;
     }
 
     modifier onlyWhenVaultUnlocked() {
-        require(vaultUnlocked, "Vault not unlocked: 5B DAI threshold not reached");
+        if (!vaultUnlocked) revert VaultLocked();
         _;
     }
 
     modifier onlyWhileConfigurable() {
-        require(canUpdateRobotConfig, "Robot configuration is permanently immutable");
+        if (!canUpdateRobotConfig) revert ConfigurationImmutable();
         _;
     }
 
-    /// @dev Zero-config: no constructor arguments. Deploy = compile + sign.
+    /// @dev Zero-config by design: deployment takes no arguments and performs no setup.
     constructor() {}
 
+    /// @notice The OBS token this vault holds.
     function obsToken() external pure returns (address) {
         return OBS_TOKEN;
     }
 
-    /* ------------------------------------------------------------------ */
-    /*              ROOMIE ROBOT HYBRID PQC CREDENTIAL LIFECYCLE           */
-    /* ------------------------------------------------------------------ */
+    /* ====================================================================== */
+    /*             ROOMIE ROBOT HYBRID PQC CREDENTIAL LIFECYCLE               */
+    /* ====================================================================== */
 
     /**
-     * @notice Day one, immediately after deployment: anchor the placeholder / provisional PQC
-     *         public-key commitment. Callable the moment the contract exists.
-     * @dev Provisional only - it does NOT enable spending. Spending requires
-     *      `commissionRoomieRobot()` with the real MCU credential.
+     * @notice Anchors the Roomie robot slot with a provisional PQC public-key commitment.
+     *         Callable the moment the contract exists.
+     * @dev Provisional only. It deliberately does NOT enable spending; that requires
+     *      {commissionRoomieRobot} with the real MCU credential.
+     * @param pqcPublicKeyHash keccak256 of the placeholder or real PQC public key.
      */
-    function setupRoomieRobotAndLock(bytes32 _pqcPublicKeyHash)
+    function setupRoomieRobotAndLock(bytes32 pqcPublicKeyHash)
         external
         onlyAdminOrRobot
         onlyWhileConfigurable
     {
-        require(_pqcPublicKeyHash != bytes32(0), "Invalid PQC public key hash");
-        robot.pqcPublicKeyHash = _pqcPublicKeyHash;
+        if (pqcPublicKeyHash == bytes32(0)) revert InvalidPqcPublicKeyHash();
+
+        robot.pqcPublicKeyHash = pqcPublicKeyHash;
         robot.provisioned = true;
-        emit RoomieRobotProvisioned(_pqcPublicKeyHash);
-        emit RoomieRobotConfigured(_pqcPublicKeyHash);
+
+        emit RoomieRobotProvisioned(pqcPublicKeyHash);
+        emit RoomieRobotConfigured(pqcPublicKeyHash);
     }
 
     /**
-     * @notice Once the Roomie humanoid robot and its hybrid PQC MCU physically arrive, bind the
-     *         real credential: the PQC public key commitment, the classical secp256k1 leg, and
-     *         the post-quantum one-time-signature hash-chain tip.
-     * @dev The biometric templates stay hard-locked on the MCU. Only these public commitments
-     *      are ever written on chain.
-     * @param _pqcPublicKeyHash keccak256 of the MCU's full PQC public key.
-     * @param _mcuEcdsaSigner   secp256k1 address derived inside the MCU secure element.
-     * @param _otsChainTip      s_N where s_i = keccak256(abi.encodePacked(s_{i-1})); the MCU holds s_0.
-     * @param _otsChainLength   number of authorisations the chain can serve.
+     * @notice Binds the real credential once the Roomie robot and its hybrid PQC MCU arrive.
+     * @dev Biometric templates stay hard-locked on the MCU and are never part of this call.
+     *      May be re-run to rotate the credential until {revokeAndUpdateImmutability}.
+     * @param pqcPublicKeyHash keccak256 of the MCU's full PQC public key.
+     * @param mcuEcdsaSigner   secp256k1 address derived inside the MCU secure element.
+     * @param otsChainTip      s_N, where s_i = keccak256(abi.encodePacked(s_{i-1})) and the MCU
+     *                         alone holds the seed s_0.
+     * @param otsChainLength   Number of authorizations the chain can serve. This is a hard
+     *                         ceiling on how many releases the credential can ever approve.
      */
     function commissionRoomieRobot(
-        bytes32 _pqcPublicKeyHash,
-        address _mcuEcdsaSigner,
-        bytes32 _otsChainTip,
-        uint64 _otsChainLength
+        bytes32 pqcPublicKeyHash,
+        address mcuEcdsaSigner,
+        bytes32 otsChainTip,
+        uint64 otsChainLength
     ) external onlyAdminOrRobot onlyWhileConfigurable {
-        require(_pqcPublicKeyHash != bytes32(0), "Invalid PQC public key hash");
-        require(_mcuEcdsaSigner != address(0), "Invalid MCU ECDSA signer");
-        require(_otsChainTip != bytes32(0), "Invalid PQC OTS chain tip");
-        require(_otsChainLength > 0, "Invalid PQC OTS chain length");
+        if (pqcPublicKeyHash == bytes32(0)) revert InvalidPqcPublicKeyHash();
+        if (mcuEcdsaSigner == address(0)) revert InvalidMcuSigner();
+        if (otsChainTip == bytes32(0)) revert InvalidOtsChainTip();
+        if (otsChainLength == 0) revert InvalidOtsChainLength();
 
-        robot.pqcPublicKeyHash = _pqcPublicKeyHash;
-        robot.mcuEcdsaSigner = _mcuEcdsaSigner;
-        robot.otsChainTip = _otsChainTip;
-        robot.otsRemaining = _otsChainLength;
+        robot.pqcPublicKeyHash = pqcPublicKeyHash;
+        robot.mcuEcdsaSigner = mcuEcdsaSigner;
+        robot.otsChainTip = otsChainTip;
+        robot.otsRemaining = otsChainLength;
         robot.provisioned = true;
         robot.commissioned = true;
 
-        emit RoomieRobotCommissioned(_pqcPublicKeyHash, _mcuEcdsaSigner, _otsChainTip, _otsChainLength);
-        emit RoomieRobotConfigured(_pqcPublicKeyHash);
+        emit RoomieRobotCommissioned(pqcPublicKeyHash, mcuEcdsaSigner, otsChainTip, otsChainLength);
+        emit RoomieRobotConfigured(pqcPublicKeyHash);
     }
 
-    /// @notice Rotate only the PQC public-key commitment (e.g. MCU firmware / key refresh).
-    function updateRobotPqcPublicKey(bytes32 _newPqcPublicKeyHash)
+    /**
+     * @notice Rotates only the PQC public-key commitment, for an MCU firmware or key refresh.
+     * @param newPqcPublicKeyHash keccak256 of the replacement PQC public key.
+     */
+    function updateRobotPqcPublicKey(bytes32 newPqcPublicKeyHash)
         external
         onlyAdminOrRobot
         onlyWhileConfigurable
     {
-        require(robot.provisioned, "Robot not yet configured");
-        require(_newPqcPublicKeyHash != bytes32(0), "Invalid PQC public key hash");
-        robot.pqcPublicKeyHash = _newPqcPublicKeyHash;
-        emit RoomieRobotConfigured(_newPqcPublicKeyHash);
+        if (!robot.provisioned) revert RobotNotProvisioned();
+        if (newPqcPublicKeyHash == bytes32(0)) revert InvalidPqcPublicKeyHash();
+
+        robot.pqcPublicKeyHash = newPqcPublicKeyHash;
+        emit RoomieRobotConfigured(newPqcPublicKeyHash);
     }
 
     /**
-     * @notice FINAL, IRREVERSIBLE. After this transaction the robot credential - PQC public key,
-     *         MCU ECDSA signer and OTS chain - can never be changed by anyone, ever. The contract
-     *         becomes permanently immutable in configuration.
+     * @notice FINAL AND IRREVERSIBLE. Freezes the robot configuration forever.
+     * @dev After this call the PQC public key, MCU signer and OTS chain can never be changed
+     *      again by anyone, the orchestrator included. Governance, releases and completion
+     *      continue to operate under the now-permanent credential.
+     *
+     *      Ordering matters: revoking before {commissionRoomieRobot} permanently prevents every
+     *      fund release, because the commissioned flag can no longer be set.
      */
     function revokeAndUpdateImmutability() external onlyAdminOrRobot onlyWhileConfigurable {
         canUpdateRobotConfig = false;
@@ -357,16 +522,58 @@ contract BeeHabitatDAO is ReentrancyGuard {
     }
 
     /**
-     * @dev Hybrid post-quantum + classical verification of an MCU authorisation.
+     * @dev Minimal, self-contained secp256k1 recovery. Rejects malformed and malleable (high-s)
+     *      signatures and the zero address, so a forged signature can never resolve to an unset
+     *      signer. Inlined deliberately: an immutable contract should carry no avoidable
+     *      dependency, and this keeps the verified surface small enough to read in full.
+     * @param digest    The EIP-191 digest that was signed.
+     * @param signature 65-byte (r, s, v) signature.
+     * @return The recovered signer address.
+     */
+    function _recoverSigner(bytes32 digest, bytes calldata signature) private pure returns (address) {
+        if (signature.length != 65) revert InvalidEcdsaSignatureLength();
+
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+        assembly ("memory-safe") {
+            r := calldataload(signature.offset)
+            s := calldataload(add(signature.offset, 32))
+            v := byte(0, calldataload(add(signature.offset, 64)))
+        }
+
+        if (v < 27) {
+            unchecked {
+                v += 27;
+            }
+        }
+        if (v != 27 && v != 28) revert InvalidEcdsaSignatureV();
+        if (uint256(s) > SECP256K1_HALF_N) revert MalleableEcdsaSignature();
+
+        address signer = ecrecover(digest, v, r, s);
+        if (signer == address(0)) revert InvalidEcdsaSignature();
+        return signer;
+    }
+
+    /**
+     * @dev Hybrid post-quantum and classical verification of one MCU authorization.
      *
-     *  Leg 1 (PQ, identity)      : the full PQC public key must hash to the anchored commitment.
-     *  Leg 2 (PQ, authorisation) : reveal the next link of the MCU's keccak256 OTS hash chain.
-     *                              Replay-proof and forward-secure; survives a quantum adversary.
-     *  Leg 3 (PQ, anchoring)     : the full PQC signature is hashed and bound in, so the robot
-     *                              fleet can verify it against the anchored public key.
-     *  Leg 4 (classical)         : secp256k1 ECDSA over a domain-separated digest binding legs 1-3.
+     *      Leg 1, post-quantum identity:      the full PQC public key must hash to the anchored
+     *                                         commitment.
+     *      Leg 2, post-quantum authorization: reveal the next link of the MCU's keccak256
+     *                                         one-time-signature chain. Single-use, replay-proof
+     *                                         and forward-secure against a quantum adversary.
+     *      Leg 3, post-quantum anchoring:     the full PQC signature is hashed and bound in, so
+     *                                         the robot fleet can verify it off chain against
+     *                                         the anchored public key.
+     *      Leg 4, classical:                  secp256k1 ECDSA over a domain-separated digest
+     *                                         binding legs 1 to 3, the chain id and this
+     *                                         contract's address.
      *
-     *  Forgery requires breaking secp256k1 AND keccak256 pre-image resistance.
+     *      Forging an authorization therefore requires breaking secp256k1 AND keccak256
+     *      pre-image resistance. Breaking either one alone is not sufficient.
+     *
+     * @return pqcSignatureHash keccak256 of the supplied PQC signature, emitted for auditors.
      */
     function _verifyHybridPqcAuthorization(
         bytes32 actionDigest,
@@ -374,154 +581,153 @@ contract BeeHabitatDAO is ReentrancyGuard {
         bytes calldata pqcSignature,
         bytes calldata mcuEcdsaSignature,
         bytes32 otsPreimage
-    ) internal returns (bytes32 pqcSignatureHash) {
+    ) private returns (bytes32 pqcSignatureHash) {
         RobotCredential storage cred = robot;
-        require(cred.commissioned, "Roomie robot MCU not commissioned");
+        if (!cred.commissioned) revert RobotNotCommissioned();
 
-        // Leg 1 - post-quantum identity commitment.
-        require(pqcPublicKey.length >= MIN_PQC_PUBLIC_KEY_BYTES, "PQC public key too short");
-        require(keccak256(pqcPublicKey) == cred.pqcPublicKeyHash, "PQC public key mismatch");
+        // Leg 1: post-quantum identity commitment.
+        if (pqcPublicKey.length < MIN_PQC_PUBLIC_KEY_BYTES) revert PqcPublicKeyTooShort();
+        bytes32 anchoredKeyHash = cred.pqcPublicKeyHash;
+        if (keccak256(pqcPublicKey) != anchoredKeyHash) revert PqcPublicKeyMismatch();
 
-        // Leg 2 - post-quantum one-time-signature chain link.
-        require(cred.otsRemaining > 0, "PQC OTS chain exhausted");
-        require(keccak256(abi.encodePacked(otsPreimage)) == cred.otsChainTip, "Invalid PQC OTS preimage");
+        // Leg 2: post-quantum one-time-signature chain link.
+        if (cred.otsRemaining == 0) revert OtsChainExhausted();
+        if (keccak256(abi.encodePacked(otsPreimage)) != cred.otsChainTip) revert InvalidOtsPreimage();
 
-        // Leg 3 - anchor the full PQC signature.
-        require(pqcSignature.length >= MIN_PQC_SIGNATURE_BYTES, "PQC signature too short");
+        // Leg 3: anchor the full PQC signature.
+        if (pqcSignature.length < MIN_PQC_SIGNATURE_BYTES) revert PqcSignatureTooShort();
         pqcSignatureHash = keccak256(pqcSignature);
 
-        // Leg 4 - classical secp256k1 leg over everything above, domain separated.
+        // Leg 4: classical secp256k1 over everything above, domain separated.
         bytes32 payload = keccak256(
             abi.encode(
-                block.chainid,
-                address(this),
-                actionDigest,
-                cred.pqcPublicKeyHash,
-                pqcSignatureHash,
-                otsPreimage
+                block.chainid, address(this), actionDigest, anchoredKeyHash, pqcSignatureHash, otsPreimage
             )
         );
         bytes32 digest = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", payload));
-        require(_recoverSigner(digest, mcuEcdsaSignature) == cred.mcuEcdsaSigner, "Invalid MCU ECDSA signature");
+        if (_recoverSigner(digest, mcuEcdsaSignature) != cred.mcuEcdsaSigner) revert EcdsaSignerMismatch();
 
-        // Consume the one-time link.
+        // Consume the one-time link, advancing the tip so this preimage can never be reused.
         cred.otsChainTip = otsPreimage;
         unchecked {
             cred.otsRemaining -= 1;
         }
     }
 
-    /**
-     * @dev Minimal, self-contained secp256k1 recovery. Rejects malleable (high-s) signatures and
-     *      the zero address so a forged signature can never resolve to an unset signer. Inlined
-     *      deliberately: an immutable contract should not carry avoidable dependencies.
-     */
-    function _recoverSigner(bytes32 digest, bytes calldata signature) internal pure returns (address) {
-        require(signature.length == 65, "Invalid ECDSA signature length");
-        bytes32 r;
-        bytes32 s;
-        uint8 v;
-        assembly {
-            r := calldataload(signature.offset)
-            s := calldataload(add(signature.offset, 32))
-            v := byte(0, calldataload(add(signature.offset, 64)))
-        }
-        if (v < 27) {
-            v += 27;
-        }
-        require(v == 27 || v == 28, "Invalid ECDSA signature v");
-        require(
-            uint256(s) <= 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0,
-            "Malleable ECDSA signature"
-        );
-        address signer = ecrecover(digest, v, r, s);
-        require(signer != address(0), "Invalid ECDSA signature");
-        return signer;
-    }
-
-    /* ------------------------------------------------------------------ */
-    /*                 TRUSTLESS BONDING-CURVE VAULT UNLOCK                */
-    /* ------------------------------------------------------------------ */
+    /* ====================================================================== */
+    /*                 TRUSTLESS BONDING-CURVE VAULT UNLOCK                   */
+    /* ====================================================================== */
 
     /**
      * @notice Reads the OBS bonding-curve DAI reserves directly from the OBS token contract.
-     * @dev Fully off-grid: no oracle, no relayer, no caller-supplied value.
+     * @dev Fully off-grid: no oracle, no relayer, no caller-supplied value. Falls back to
+     *      `totalDaiCollected()` and finally to zero, so the unlock always fails closed rather
+     *      than open if the token's interface is ever unavailable.
+     * @return The curve's DAI reserves, in DAI wei.
      */
     function bondingCurveDaiReserves() public view returns (uint256) {
         (bool ok, bytes memory data) = OBS_TOKEN.staticcall(abi.encodeWithSelector(SEL_DAI_RESERVE));
         if (ok && data.length >= 32) {
             return abi.decode(data, (uint256));
         }
+
         (ok, data) = OBS_TOKEN.staticcall(abi.encodeWithSelector(SEL_TOTAL_DAI_COLLECTED));
         if (ok && data.length >= 32) {
             return abi.decode(data, (uint256));
         }
+
         return 0;
     }
 
-    /// @notice Permissionless. Unlocks the vault only when the curve genuinely holds 5B DAI.
+    /**
+     * @notice Unlocks the vault once the curve genuinely holds 5,000,000,000 DAI.
+     * @dev Permissionless and argument-free by design. Not even the orchestrator can unlock an
+     *      under-funded curve, because there is no value for a caller to supply.
+     */
     function checkAndUnlockVault() external {
-        require(!vaultUnlocked, "Vault already unlocked");
+        if (vaultUnlocked) revert VaultAlreadyUnlocked();
+
         uint256 reserves = bondingCurveDaiReserves();
-        require(reserves >= BONDING_CURVE_DAI_UNLOCK_TARGET, "Target of 5 Billion DAI not reached");
+        if (reserves < BONDING_CURVE_DAI_UNLOCK_TARGET) revert BondingCurveTargetNotReached();
+
         vaultUnlocked = true;
         emit VaultUnlockedByBondingCurve(reserves);
     }
 
-    /* ------------------------------------------------------------------ */
-    /*                        OBS VAULT (RECEIVE/HOLD)                     */
-    /* ------------------------------------------------------------------ */
+    /* ====================================================================== */
+    /*                      OBS VAULT: RECEIVE AND HOLD                       */
+    /* ====================================================================== */
 
+    /**
+     * @notice Deposits OBS into the vault.
+     * @dev Credits the balance actually received, so a fee-on-transfer or rebasing OBS cannot
+     *      desynchronise internal accounting from the token balance.
+     * @param amount OBS to pull from the caller. Requires prior approval.
+     */
     function depositToVault(uint256 amount) external nonReentrant {
-        require(amount > 0, "Nothing to deposit");
-        uint256 before = IERC20(OBS_TOKEN).balanceOf(address(this));
+        if (amount == 0) revert NothingToDeposit();
+
+        uint256 balanceBefore = IERC20(OBS_TOKEN).balanceOf(address(this));
         IERC20(OBS_TOKEN).safeTransferFrom(msg.sender, address(this), amount);
-        uint256 received = IERC20(OBS_TOKEN).balanceOf(address(this)) - before;
+        uint256 received = IERC20(OBS_TOKEN).balanceOf(address(this)) - balanceBefore;
+
         totalObsVaultBalance += received;
         emit VaultDeposit(msg.sender, received);
     }
 
-    /// @notice Permissionless. Credits OBS sent to the vault by a plain `transfer`.
+    /**
+     * @notice Credits OBS that was sent to the vault by a plain `transfer`.
+     * @dev Permissionless. Donations can only ever increase the vault.
+     * @return credited The newly credited amount.
+     */
     function syncVault() external returns (uint256 credited) {
         uint256 actual = IERC20(OBS_TOKEN).balanceOf(address(this));
-        require(actual > totalObsVaultBalance, "Nothing to sync");
+        uint256 tracked = totalObsVaultBalance;
+        if (actual <= tracked) revert NothingToSync();
+
         unchecked {
-            credited = actual - totalObsVaultBalance;
+            credited = actual - tracked;
         }
         totalObsVaultBalance = actual;
         emit VaultSynced(credited, actual);
     }
 
+    /// @notice The vault's live OBS token balance.
     function getVaultBalance() external view returns (uint256) {
         return IERC20(OBS_TOKEN).balanceOf(address(this));
     }
 
     /// @notice Vault OBS not already committed to a live project.
     function availableVaultBalance() public view returns (uint256) {
+        uint256 tracked = totalObsVaultBalance;
         uint256 reserved = totalReservedForProjects;
-        return totalObsVaultBalance > reserved ? totalObsVaultBalance - reserved : 0;
+        return tracked > reserved ? tracked - reserved : 0;
     }
 
-    /* ------------------------------------------------------------------ */
-    /*             MONTHLY LP: 100 / MONTH, EXPIRING, 1 LP = 1 VOTE        */
-    /* ------------------------------------------------------------------ */
+    /* ====================================================================== */
+    /*         MONTHLY LP: 100 PER MONTH, EXPIRING, ONE LP IS ONE VOTE        */
+    /* ====================================================================== */
 
+    /// @notice The current 30-day LP epoch index.
     function currentEpoch() public view returns (uint256) {
         return block.timestamp / LP_EPOCH;
     }
 
     /**
-     * @notice Issue expiring LP. Hard cap of 100 LP per member per month, cumulative across all
-     *         calls in that month. Unused LP expires at the month boundary and is never carried.
+     * @notice Issues expiring LP to a member.
+     * @dev The 100 LP ceiling is cumulative per member per month, not per call. Unused LP
+     *      expires at the epoch boundary and is never carried forward.
+     * @param recipient Member receiving the LP.
+     * @param amount    LP to issue, in wei.
      */
     function issueMonthlyLpTokens(address recipient, uint256 amount) external onlyAdminOrRobot {
-        require(recipient != address(0), "Invalid recipient");
-        require(amount > 0, "Nothing to issue");
-        uint256 epoch = currentEpoch();
+        if (recipient == address(0)) revert InvalidRecipient();
+        if (amount == 0) revert NothingToIssue();
 
+        uint256 epoch = currentEpoch();
         LpTokenLedger storage ledger = monthlyLpBalances[recipient];
         uint256 alreadyThisMonth = ledger.epoch == epoch ? ledger.balance : 0;
-        require(alreadyThisMonth + amount <= MONTHLY_LP_ISSUANCE, "Exceeds monthly issuance limit");
+        if (alreadyThisMonth + amount > MONTHLY_LP_ISSUANCE) revert ExceedsMonthlyIssuanceLimit();
 
         ledger.balance = alreadyThisMonth + amount;
         ledger.epoch = epoch;
@@ -530,7 +736,10 @@ contract BeeHabitatDAO is ReentrancyGuard {
         emit LpTokensIssued(recipient, amount, epoch);
     }
 
-    /// @notice 1 LP = 1 vote. Returns 0 once the LP has expired.
+    /**
+     * @notice One LP is one vote. Returns zero once the LP has expired.
+     * @param account The member to inspect.
+     */
     function getVotingPower(address account) public view returns (uint256) {
         LpTokenLedger storage ledger = monthlyLpBalances[account];
         if (ledger.epoch < currentEpoch()) {
@@ -539,15 +748,32 @@ contract BeeHabitatDAO is ReentrancyGuard {
         return ledger.balance;
     }
 
-    /// @notice Live (unexpired) LP supply - the quorum denominator.
+    /// @notice Live, unexpired LP supply. This is the quorum denominator.
     function getTotalActiveLpSupply() public view returns (uint256) {
         return lpSupplyByEpoch[currentEpoch()];
     }
 
-    /* ------------------------------------------------------------------ */
-    /*                     PROPOSALS (MISSION-CONSTRAINED)                 */
-    /* ------------------------------------------------------------------ */
+    /* ====================================================================== */
+    /*                    PROPOSALS: MISSION-CONSTRAINED                      */
+    /* ====================================================================== */
 
+    /**
+     * @notice Opens a funding proposal for an off-grid indoor bee habitat.
+     * @dev Requires 50 unexpired LP. Every hardcoded mission rule is checked here and again at
+     *      each fund release. The funding amount and payout recipient are fixed now and cannot
+     *      be chosen later at execution time.
+     * @param description                   Human-readable mission description.
+     * @param targetAcresForBees            Flowering acreage the habitat will forage.
+     * @param proposedBeePopulationIndex    Target bee population index, capped for safety.
+     * @param requestedFunding              OBS requested, in wei.
+     * @param payoutRecipient               The only address this project can ever pay.
+     * @param solarAndBatteryEquipped       Must be true.
+     * @param atmosphericWaterGenEquipped   Must be true.
+     * @param landAcquisitionIncluded       Must be true.
+     * @param equipmentAcquisitionIncluded  Must be true.
+     * @param honeyProductionAndDistribution Must be true.
+     * @return proposalId The new proposal's id.
+     */
     function createOffGridBeeHabitatProposal(
         string calldata description,
         uint256 targetAcresForBees,
@@ -559,21 +785,21 @@ contract BeeHabitatDAO is ReentrancyGuard {
         bool landAcquisitionIncluded,
         bool equipmentAcquisitionIncluded,
         bool honeyProductionAndDistribution
-    ) external returns (uint256) {
-        require(getVotingPower(msg.sender) >= PROPOSAL_THRESHOLD, "Insufficient unexpired LP tokens (50 required)");
-        require(bytes(description).length > 0, "Description required");
-        require(requestedFunding > 0, "Requested funding required");
-        require(payoutRecipient != address(0), "Invalid payout recipient");
-        require(targetAcresForBees >= MIN_FLOWERING_ACRES_TARGET, "Must meet minimum bee forage acreage mandate");
-        require(proposedBeePopulationIndex <= OPTIMAL_BEE_INDEX_CAP, "Exceeds optimal safe carrying capacity index cap");
-        require(solarAndBatteryEquipped, "Off-grid habitats must feature solar and battery storage");
-        require(atmosphericWaterGenEquipped, "Off-grid habitats must feature atmospheric water generation");
-        require(landAcquisitionIncluded, "Must include land acquisition for permanent habitat");
-        require(equipmentAcquisitionIncluded, "Must include equipment for maintenance operations");
-        require(honeyProductionAndDistribution, "Must include honey production and free distribution");
+    ) external returns (uint256 proposalId) {
+        if (getVotingPower(msg.sender) < PROPOSAL_THRESHOLD) revert InsufficientLpToPropose();
+        if (bytes(description).length == 0) revert DescriptionRequired();
+        if (requestedFunding == 0) revert FundingRequired();
+        if (payoutRecipient == address(0)) revert InvalidRecipient();
+        if (targetAcresForBees < MIN_FLOWERING_ACRES_TARGET) revert BelowMinimumAcreage();
+        if (proposedBeePopulationIndex > OPTIMAL_BEE_INDEX_CAP) revert ExceedsBeeIndexCap();
+        if (!solarAndBatteryEquipped) revert SolarAndBatteryRequired();
+        if (!atmosphericWaterGenEquipped) revert AtmosphericWaterRequired();
+        if (!landAcquisitionIncluded) revert LandAcquisitionRequired();
+        if (!equipmentAcquisitionIncluded) revert EquipmentAcquisitionRequired();
+        if (!honeyProductionAndDistribution) revert HoneyDistributionRequired();
 
-        uint256 proposalId = ++proposalCount;
-        OffGridHabitatProposal storage prop = proposals[proposalId];
+        proposalId = ++proposalCount;
+        OffGridHabitatProposal storage prop = _proposals[proposalId];
         prop.id = proposalId;
         prop.proposer = msg.sender;
         prop.payoutRecipient = payoutRecipient;
@@ -599,17 +825,21 @@ contract BeeHabitatDAO is ReentrancyGuard {
             requestedFunding,
             payoutRecipient
         );
-        return proposalId;
     }
 
+    /**
+     * @notice Casts a vote weighted one-to-one by the caller's unexpired LP.
+     * @param proposalId The proposal to vote on.
+     * @param support    True to vote for, false against.
+     */
     function vote(uint256 proposalId, bool support) external {
-        OffGridHabitatProposal storage prop = proposals[proposalId];
-        require(prop.id != 0, "Proposal does not exist");
-        require(block.timestamp >= prop.startTime && block.timestamp <= prop.endTime, "Voting inactive");
-        require(!prop.hasVoted[msg.sender], "Already voted");
+        OffGridHabitatProposal storage prop = _proposals[proposalId];
+        if (prop.id == 0) revert ProposalNotFound();
+        if (block.timestamp < prop.startTime || block.timestamp > prop.endTime) revert VotingInactive();
+        if (prop.hasVoted[msg.sender]) revert AlreadyVoted();
 
         uint256 weight = getVotingPower(msg.sender);
-        require(weight > 0, "No active unexpired LP voting power");
+        if (weight == 0) revert NoVotingPower();
 
         prop.hasVoted[msg.sender] = true;
         if (support) {
@@ -622,44 +852,52 @@ contract BeeHabitatDAO is ReentrancyGuard {
     }
 
     /**
-     * @notice Permissionless execution of a passed proposal. The funding amount is whatever the
-     *         DAO voted on - it can never be chosen at execution time.
-     * @dev Mathematically stretches the spend over >= MIN_PROJECT_MILESTONES tranches of 60 days.
+     * @notice Executes a passed proposal into a funded, time-locked project.
+     * @dev Permissionless: the funding amount and recipient come from the proposal the DAO
+     *      voted on, so an executor has nothing left to choose. The spend is stretched over
+     *      max(MIN_PROJECT_MILESTONES, ceil(funding / trancheCeiling)) tranches of 60 days.
+     * @param proposalId The proposal to execute.
+     * @return projectId The new project's id.
      */
-    function executeProposal(uint256 proposalId) external onlyWhenVaultUnlocked returns (uint256) {
-        OffGridHabitatProposal storage prop = proposals[proposalId];
-        require(prop.id != 0, "Proposal does not exist");
-        require(block.timestamp > prop.endTime, "Voting period not ended");
-        require(!prop.executed, "Proposal already executed");
-        require(!prop.canceled, "Proposal canceled");
+    function executeProposal(uint256 proposalId)
+        external
+        onlyWhenVaultUnlocked
+        returns (uint256 projectId)
+    {
+        OffGridHabitatProposal storage prop = _proposals[proposalId];
+        if (prop.id == 0) revert ProposalNotFound();
+        if (block.timestamp <= prop.endTime) revert VotingNotEnded();
+        if (prop.executed) revert ProposalAlreadyExecuted();
 
-        uint256 totalVotes = prop.forVotes + prop.againstVotes;
-        require(totalVotes > 0, "No votes cast");
-        require(prop.forVotes > prop.againstVotes, "Proposal rejected: against votes exceed for votes");
-
-        uint256 epochSupply = lpSupplyByEpoch[prop.startEpoch];
-        require(totalVotes * 100 >= epochSupply * QUORUM_PERCENTAGE, "Quorum not reached");
+        uint256 forVotes = prop.forVotes;
+        uint256 againstVotes = prop.againstVotes;
+        uint256 totalVotes = forVotes + againstVotes;
+        if (totalVotes == 0) revert NoVotesCast();
+        if (forVotes <= againstVotes) revert ProposalRejected();
+        if (totalVotes * 100 < lpSupplyByEpoch[prop.startEpoch] * QUORUM_PERCENTAGE) {
+            revert QuorumNotReached();
+        }
 
         uint256 funding = prop.requestedFunding;
-        uint256 available = availableVaultBalance();
-        require(funding <= (available * MAX_PROJECT_BPS_OF_VAULT) / BPS_DENOMINATOR, "Exceeds max project share of vault");
+        if (funding > (availableVaultBalance() * MAX_PROJECT_BPS_OF_VAULT) / BPS_DENOMINATOR) {
+            revert ExceedsMaxProjectShare();
+        }
+
+        // The anti-dump ceiling is fixed at approval time against the vault as it stands, so the
+        // schedule is deterministic and the project can actually be finished.
+        uint256 trancheCeiling = (totalObsVaultBalance * MAX_TRANCHE_BPS_OF_VAULT) / BPS_DENOMINATOR;
+        if (trancheCeiling == 0) revert VaultTooSmallForSchedule();
+
+        uint256 required = (funding + trancheCeiling - 1) / trancheCeiling;
+        uint32 milestoneCount =
+            required > MIN_PROJECT_MILESTONES ? uint32(required) : MIN_PROJECT_MILESTONES;
+        if (milestoneCount > MAX_PROJECT_MILESTONES) revert ExceedsScheduleLimit();
+        uint256 perMilestoneCap = (funding + milestoneCount - 1) / milestoneCount;
 
         prop.executed = true;
 
-        // Anti-dump ceiling is fixed at approval time against the vault as it stands, so the
-        // schedule is deterministic and the project can actually be finished.
-        uint256 trancheCeiling = (totalObsVaultBalance * MAX_TRANCHE_BPS_OF_VAULT) / BPS_DENOMINATOR;
-        require(trancheCeiling > 0, "Vault too small for an anti-dump schedule");
-
-        // Stretch the spend over however many 60-day tranches the anti-dump ceiling demands,
-        // and never fewer than MIN_PROJECT_MILESTONES.
-        uint256 required = (funding + trancheCeiling - 1) / trancheCeiling;
-        uint32 milestoneCount = required > MIN_PROJECT_MILESTONES ? uint32(required) : MIN_PROJECT_MILESTONES;
-        require(milestoneCount <= MAX_PROJECT_MILESTONES, "Funding exceeds anti-dump schedule limit");
-        uint256 perMilestoneCap = (funding + milestoneCount - 1) / milestoneCount;
-
-        uint256 projectId = ++projectCount;
-        Project storage project = projects[projectId];
+        projectId = ++projectCount;
+        Project storage project = _projects[projectId];
         project.id = projectId;
         project.proposalId = proposalId;
         project.creator = prop.proposer;
@@ -670,20 +908,23 @@ contract BeeHabitatDAO is ReentrancyGuard {
         project.trancheCeiling = trancheCeiling;
         project.milestoneCount = milestoneCount;
         project.startTime = block.timestamp;
-        project.deadline = block.timestamp + (uint256(milestoneCount) * MILESTONE_GATING_INTERVAL) + PROJECT_GRACE_PERIOD;
+        project.deadline =
+            block.timestamp + (uint256(milestoneCount) * MILESTONE_GATING_INTERVAL) + PROJECT_GRACE_PERIOD;
         project.missionDescription = prop.description;
 
         totalReservedForProjects += funding;
 
-        emit ProjectCreated(projectId, proposalId, prop.proposer, funding, milestoneCount, perMilestoneCap, project.deadline);
-        return projectId;
+        emit ProjectCreated(
+            projectId, proposalId, prop.proposer, funding, milestoneCount, perMilestoneCap, project.deadline
+        );
     }
 
-    /* ------------------------------------------------------------------ */
-    /*        ROBOT-ENFORCED, TIME-LOCKED, MISSION-BOUND FUND RELEASE      */
-    /* ------------------------------------------------------------------ */
+    /* ====================================================================== */
+    /*      ROBOT-ENFORCED, TIME-LOCKED, MISSION-BOUND FUND RELEASE           */
+    /* ====================================================================== */
 
-    function _attestationHash(MilestoneAttestation calldata att) internal pure returns (bytes32) {
+    /// @dev Hashes an attestation for inclusion in the MCU-signed digest.
+    function _attestationHash(MilestoneAttestation calldata att) private pure returns (bytes32) {
         return keccak256(
             abi.encode(
                 att.acresSecured,
@@ -701,31 +942,43 @@ contract BeeHabitatDAO is ReentrancyGuard {
         );
     }
 
-    /// @dev The hardcoded mission rules, re-enforced on chain at EVERY single fund release.
-    function _enforceMissionRules(MilestoneAttestation calldata att) internal pure {
-        require(att.offGridVerified, "Mission rule: site must be fully off-grid");
-        require(att.solarKwhGenerated > 0, "Mission rule: solar generation required");
-        require(att.batteryKwhStored > 0, "Mission rule: battery storage required");
-        require(att.atmosphericWaterLiters > 0, "Mission rule: atmospheric water generation required");
-        require(att.honeyKgDistributedFree > 0, "Mission rule: free honey distribution required");
-        require(att.hivesInstalled > 0, "Mission rule: indoor bee habitat hives required");
-        require(att.landAcquired, "Mission rule: land must be acquired/held");
-        require(att.equipmentOperational, "Mission rule: maintenance equipment must be operational");
-        require(att.evidenceHash != bytes32(0), "Mission rule: robot evidence bundle required");
+    /// @dev The hardcoded mission rules, re-enforced on chain at every single fund release.
+    function _enforceMissionRules(MilestoneAttestation calldata att) private pure {
+        if (!att.offGridVerified) revert MissionRuleOffGridRequired();
+        if (att.solarKwhGenerated == 0) revert MissionRuleSolarRequired();
+        if (att.batteryKwhStored == 0) revert MissionRuleBatteryRequired();
+        if (att.atmosphericWaterLiters == 0) revert MissionRuleWaterRequired();
+        if (att.honeyKgDistributedFree == 0) revert MissionRuleHoneyRequired();
+        if (att.hivesInstalled == 0) revert MissionRuleHivesRequired();
+        if (!att.landAcquired) revert MissionRuleLandRequired();
+        if (!att.equipmentOperational) revert MissionRuleEquipmentRequired();
+        if (att.evidenceHash == bytes32(0)) revert MissionRuleEvidenceRequired();
     }
 
     /**
      * @notice The single path by which OBS can ever leave this vault.
      *
-     * Every one of these must hold:
-     *   - the bonding curve has genuinely collected 5B DAI;
-     *   - the Roomie robot MCU is commissioned;
-     *   - at most one authorisation per project per 60 days;
-     *   - hybrid PQC + ECDSA authorisation from the MCU (biometrics verified on the MCU itself);
-     *   - the hardcoded mission rules are attested as actually happening in the real world;
-     *   - the tranche is <= the project's mathematical per-milestone cap AND <= 2.5% of the vault.
+     * @dev Every one of the following must hold:
+     *      - the bonding curve has genuinely collected 5,000,000,000 DAI;
+     *      - the Roomie robot MCU is commissioned;
+     *      - at most one authorization per project per 60 days;
+     *      - a valid hybrid PQC and ECDSA authorization from the MCU, which verifies the
+     *        operator's biometrics locally before signing;
+     *      - the hardcoded mission rules are attested as happening in the real world;
+     *      - the tranche is within both the project's per-milestone cap and its anti-dump
+     *        tranche ceiling.
      *
-     * Funds go only to the payout recipient the DAO voted on. There is no arbitrary recipient.
+     *      Funds go only to the payout recipient the DAO voted on. There is no arbitrary
+     *      recipient anywhere in this contract. Checks-Effects-Interactions is observed: the
+     *      token transfer is the final statement.
+     *
+     * @param projectId          Project to release against.
+     * @param amount             OBS to release, in wei.
+     * @param attestation        The robot's real-world evidence for this tranche.
+     * @param pqcPublicKey       The MCU's full PQC public key.
+     * @param pqcSignature       The MCU's full PQC signature over the authorization.
+     * @param mcuEcdsaSignature  The MCU's 65-byte secp256k1 signature over the hybrid digest.
+     * @param otsPreimage        The next link of the MCU's one-time-signature hash chain.
      */
     function robotAuthorizeAndReleaseMilestone(
         uint256 projectId,
@@ -736,45 +989,45 @@ contract BeeHabitatDAO is ReentrancyGuard {
         bytes calldata mcuEcdsaSignature,
         bytes32 otsPreimage
     ) external onlyAdminOrRobot onlyWhenVaultUnlocked nonReentrant {
-        Project storage project = projects[projectId];
-        require(project.id != 0, "Project does not exist");
-        require(!project.completed, "Project already completed");
-        require(!project.expired, "Project expired");
-        require(block.timestamp <= project.deadline, "Project deadline passed");
-        require(project.milestonesCompleted < project.milestoneCount, "All milestones already completed");
+        Project storage project = _projects[projectId];
+        if (project.id == 0) revert ProjectNotFound();
+        if (project.completed) revert ProjectAlreadyCompleted();
+        if (project.expired) revert ProjectHasExpired();
+        if (block.timestamp > project.deadline) revert ProjectDeadlinePassed();
 
-        uint256 last = project.lastMilestoneTime;
-        if (last != 0) {
-            require(
-                block.timestamp >= last + MILESTONE_GATING_INTERVAL,
-                "Milestone locked: Bi-monthly cycle (1 time every 2 months) not reached"
-            );
+        uint32 milestoneIndex = project.milestonesCompleted;
+        if (milestoneIndex >= project.milestoneCount) revert AllMilestonesCompleted();
+
+        uint256 lastMilestoneTime = project.lastMilestoneTime;
+        if (lastMilestoneTime != 0 && block.timestamp < lastMilestoneTime + MILESTONE_GATING_INTERVAL) {
+            revert MilestoneLocked();
         }
 
-        require(amount > 0, "Nothing to release");
-        require(amount <= project.perMilestoneCap, "Exceeds per-milestone cap");
-        require(amount <= project.fundingRemaining, "Exceeds remaining project funding");
-        require(amount <= project.trancheCeiling, "Exceeds anti-dump tranche cap");
-        require(amount <= totalObsVaultBalance, "Insufficient vault balance");
+        if (amount == 0) revert NothingToRelease();
+        if (amount > project.perMilestoneCap) revert ExceedsPerMilestoneCap();
+        if (amount > project.fundingRemaining) revert ExceedsRemainingFunding();
+        if (amount > project.trancheCeiling) revert ExceedsTrancheCap();
+        if (amount > totalObsVaultBalance) revert InsufficientVaultBalance();
 
         _enforceMissionRules(attestation);
 
-        uint32 milestoneIndex = project.milestonesCompleted;
+        address recipient = project.payoutRecipient;
         bytes32 actionDigest = keccak256(
             abi.encode(
                 MILESTONE_TYPEHASH,
                 projectId,
                 milestoneIndex,
                 amount,
-                project.payoutRecipient,
+                recipient,
                 _attestationHash(attestation)
             )
         );
-        bytes32 pqcSignatureHash =
-            _verifyHybridPqcAuthorization(actionDigest, pqcPublicKey, pqcSignature, mcuEcdsaSignature, otsPreimage);
+        bytes32 pqcSignatureHash = _verifyHybridPqcAuthorization(
+            actionDigest, pqcPublicKey, pqcSignature, mcuEcdsaSignature, otsPreimage
+        );
 
-        // -------- effects --------
-        MissionLedger storage ledger = missionLedgers[projectId];
+        // ----------------------------- effects ------------------------------
+        MissionLedger storage ledger = _missionLedgers[projectId];
         ledger.acresSecured += attestation.acresSecured;
         ledger.hivesInstalled += attestation.hivesInstalled;
         ledger.honeyKgDistributedFree += attestation.honeyKgDistributedFree;
@@ -784,10 +1037,12 @@ contract BeeHabitatDAO is ReentrancyGuard {
 
         project.lastMilestoneTime = block.timestamp;
         project.milestonesCompleted = milestoneIndex + 1;
-        project.fundingRemaining -= amount;
-
-        totalObsVaultBalance -= amount;
-        totalReservedForProjects -= amount;
+        unchecked {
+            // All three subtractions are bounded by the checks above.
+            project.fundingRemaining -= amount;
+            totalObsVaultBalance -= amount;
+            totalReservedForProjects -= amount;
+        }
         totalObsReleased += amount;
 
         _accrueBeeFlourishing(attestation.beeFlourishingIndexDelta);
@@ -795,20 +1050,23 @@ contract BeeHabitatDAO is ReentrancyGuard {
         emit MilestoneAuthorizedByRobot(
             projectId, milestoneIndex, amount, pqcSignatureHash, attestation.evidenceHash, block.timestamp
         );
+        emit ProjectFundsWithdrawn(projectId, amount, recipient);
 
-        // -------- interaction --------
-        IERC20(OBS_TOKEN).safeTransfer(project.payoutRecipient, amount);
-        emit ProjectFundsWithdrawn(projectId, amount, project.payoutRecipient);
+        // --------------------------- interaction ----------------------------
+        IERC20(OBS_TOKEN).safeTransfer(recipient, amount);
     }
 
-    function _accrueBeeFlourishing(uint256 delta) internal {
+    /// @dev Accrues robot-attested flourishing progress, capped at the safe optimum.
+    function _accrueBeeFlourishing(uint256 delta) private {
         if (delta == 0) return;
+
         uint256 next = beeFlourishingIndex + delta;
         if (next > OPTIMAL_BEE_INDEX_CAP) {
             next = OPTIMAL_BEE_INDEX_CAP;
         }
         beeFlourishingIndex = next;
         emit BeeFlourishingIndexUpdated(next);
+
         if (!optimalBeeFlourishingReached && next >= TARGET_BEE_FLOURISHING_INDEX) {
             optimalBeeFlourishingReached = true;
             emit OptimalBeeFlourishingReached(next, block.timestamp);
@@ -816,102 +1074,121 @@ contract BeeHabitatDAO is ReentrancyGuard {
     }
 
     /**
-     * @notice A project can only be closed when the ENTIRETY of it is done: every mathematically
-     *         scheduled milestone delivered and every hardcoded mission outcome met.
+     * @notice Closes a project once the entirety of it is done.
+     * @dev Requires every scheduled milestone to have been delivered and the cumulative mission
+     *      ledger to show real acreage, hives, free honey, water, solar and battery. Any
+     *      unspent allocation returns to the vault.
+     * @param projectId The project to close.
      */
     function completeProject(uint256 projectId) external onlyAdminOrRobot {
-        Project storage project = projects[projectId];
-        require(project.id != 0, "Project does not exist");
-        require(!project.completed, "Project already completed");
-        require(!project.expired, "Project expired");
-        require(project.milestonesCompleted == project.milestoneCount, "All milestones must be delivered");
+        Project storage project = _projects[projectId];
+        if (project.id == 0) revert ProjectNotFound();
+        if (project.completed) revert ProjectAlreadyCompleted();
+        if (project.expired) revert ProjectHasExpired();
+        if (project.milestonesCompleted != project.milestoneCount) revert MilestonesIncomplete();
 
-        MissionLedger storage ledger = missionLedgers[projectId];
-        require(ledger.acresSecured >= MIN_FLOWERING_ACRES_TARGET, "Acreage mandate not met");
-        require(ledger.hivesInstalled > 0, "No hives installed");
-        require(ledger.honeyKgDistributedFree > 0, "No free honey distributed");
-        require(ledger.atmosphericWaterLiters > 0, "No atmospheric water generated");
-        require(ledger.solarKwhGenerated > 0, "No solar energy generated");
-        require(ledger.batteryKwhStored > 0, "No battery storage recorded");
+        MissionLedger storage ledger = _missionLedgers[projectId];
+        if (ledger.acresSecured < MIN_FLOWERING_ACRES_TARGET) revert MissionOutcomeNotMet();
+        if (
+            ledger.hivesInstalled == 0 || ledger.honeyKgDistributedFree == 0
+                || ledger.atmosphericWaterLiters == 0 || ledger.solarKwhGenerated == 0
+                || ledger.batteryKwhStored == 0
+        ) {
+            revert MissionOutcomeNotMet();
+        }
 
         project.completed = true;
 
         uint256 unspent = project.fundingRemaining;
-        if (unspent > 0) {
+        if (unspent != 0) {
             project.fundingRemaining = 0;
-            totalReservedForProjects -= unspent; // returns to the vault, never burned
+            unchecked {
+                totalReservedForProjects -= unspent; // returns to the vault, never burned
+            }
         }
 
         emit ProjectCompleted(projectId);
     }
 
     /**
-     * @notice Permissionless timeout. Unspent funds return to the vault - they are never
-     *         destroyed and never become withdrawable outside the milestone path.
+     * @notice Expires a project that has run past its deadline.
+     * @dev Permissionless. Unspent OBS returns to the vault; it is never destroyed and never
+     *      becomes withdrawable outside the milestone path.
+     * @param projectId The project to expire.
      */
     function checkProjectTimeout(uint256 projectId) external {
-        Project storage project = projects[projectId];
-        require(project.id != 0, "Project does not exist");
-        require(!project.completed, "Project already completed");
-        require(!project.expired, "Project already expired");
-        require(block.timestamp > project.deadline, "Project deadline not reached");
+        Project storage project = _projects[projectId];
+        if (project.id == 0) revert ProjectNotFound();
+        if (project.completed) revert ProjectAlreadyCompleted();
+        if (project.expired) revert ProjectAlreadyExpired();
+        if (block.timestamp <= project.deadline) revert ProjectDeadlineNotReached();
 
         project.expired = true;
+
         uint256 returned = project.fundingRemaining;
-        if (returned > 0) {
+        if (returned != 0) {
             project.fundingRemaining = 0;
-            totalReservedForProjects -= returned;
+            unchecked {
+                totalReservedForProjects -= returned;
+            }
         }
 
         emit ProjectExpired(projectId, returned);
     }
 
-    /* ------------------------------------------------------------------ */
-    /*                            VIEW HELPERS                             */
-    /* ------------------------------------------------------------------ */
+    /* ====================================================================== */
+    /*                              VIEW HELPERS                              */
+    /* ====================================================================== */
 
-    function getProposalId(uint256 proposalId) external view returns (uint256) { return proposals[proposalId].id; }
-    function getProposalProposer(uint256 proposalId) external view returns (address) { return proposals[proposalId].proposer; }
-    function getProposalPayoutRecipient(uint256 proposalId) external view returns (address) { return proposals[proposalId].payoutRecipient; }
-    function getProposalDescription(uint256 proposalId) external view returns (string memory) { return proposals[proposalId].description; }
-    function getProposalTargetAcres(uint256 proposalId) external view returns (uint256) { return proposals[proposalId].targetAcresForBees; }
-    function getProposalBeeIndex(uint256 proposalId) external view returns (uint256) { return proposals[proposalId].proposedBeePopulationIndex; }
-    function getProposalRequestedFunding(uint256 proposalId) external view returns (uint256) { return proposals[proposalId].requestedFunding; }
-    function getProposalSolarAndBattery(uint256 proposalId) external view returns (bool) { return proposals[proposalId].solarAndBatteryEquipped; }
-    function getProposalAwg(uint256 proposalId) external view returns (bool) { return proposals[proposalId].atmosphericWaterGenEquipped; }
-    function getProposalLandAcquisition(uint256 proposalId) external view returns (bool) { return proposals[proposalId].landAcquisitionIncluded; }
-    function getProposalEquipmentAcquisition(uint256 proposalId) external view returns (bool) { return proposals[proposalId].equipmentAcquisitionIncluded; }
-    function getProposalHoneyProduction(uint256 proposalId) external view returns (bool) { return proposals[proposalId].honeyProductionAndDistribution; }
-    function getProposalForVotes(uint256 proposalId) external view returns (uint256) { return proposals[proposalId].forVotes; }
-    function getProposalAgainstVotes(uint256 proposalId) external view returns (uint256) { return proposals[proposalId].againstVotes; }
-    function getProposalStartTime(uint256 proposalId) external view returns (uint256) { return proposals[proposalId].startTime; }
-    function getProposalEndTime(uint256 proposalId) external view returns (uint256) { return proposals[proposalId].endTime; }
-    function getProposalExecuted(uint256 proposalId) external view returns (bool) { return proposals[proposalId].executed; }
-    function getProposalCanceled(uint256 proposalId) external view returns (bool) { return proposals[proposalId].canceled; }
-    function hasVoted(uint256 proposalId, address voter) external view returns (bool) { return proposals[proposalId].hasVoted[voter]; }
+    function getProposalId(uint256 proposalId) external view returns (uint256) { return _proposals[proposalId].id; }
+    function getProposalProposer(uint256 proposalId) external view returns (address) { return _proposals[proposalId].proposer; }
+    function getProposalPayoutRecipient(uint256 proposalId) external view returns (address) { return _proposals[proposalId].payoutRecipient; }
+    function getProposalDescription(uint256 proposalId) external view returns (string memory) { return _proposals[proposalId].description; }
+    function getProposalTargetAcres(uint256 proposalId) external view returns (uint256) { return _proposals[proposalId].targetAcresForBees; }
+    function getProposalBeeIndex(uint256 proposalId) external view returns (uint256) { return _proposals[proposalId].proposedBeePopulationIndex; }
+    function getProposalRequestedFunding(uint256 proposalId) external view returns (uint256) { return _proposals[proposalId].requestedFunding; }
+    function getProposalSolarAndBattery(uint256 proposalId) external view returns (bool) { return _proposals[proposalId].solarAndBatteryEquipped; }
+    function getProposalAwg(uint256 proposalId) external view returns (bool) { return _proposals[proposalId].atmosphericWaterGenEquipped; }
+    function getProposalLandAcquisition(uint256 proposalId) external view returns (bool) { return _proposals[proposalId].landAcquisitionIncluded; }
+    function getProposalEquipmentAcquisition(uint256 proposalId) external view returns (bool) { return _proposals[proposalId].equipmentAcquisitionIncluded; }
+    function getProposalHoneyProduction(uint256 proposalId) external view returns (bool) { return _proposals[proposalId].honeyProductionAndDistribution; }
+    function getProposalForVotes(uint256 proposalId) external view returns (uint256) { return _proposals[proposalId].forVotes; }
+    function getProposalAgainstVotes(uint256 proposalId) external view returns (uint256) { return _proposals[proposalId].againstVotes; }
+    function getProposalStartTime(uint256 proposalId) external view returns (uint256) { return _proposals[proposalId].startTime; }
+    function getProposalEndTime(uint256 proposalId) external view returns (uint256) { return _proposals[proposalId].endTime; }
+    function getProposalStartEpoch(uint256 proposalId) external view returns (uint256) { return _proposals[proposalId].startEpoch; }
+    function getProposalExecuted(uint256 proposalId) external view returns (bool) { return _proposals[proposalId].executed; }
 
-    function getProjectId(uint256 projectId) external view returns (uint256) { return projects[projectId].id; }
-    function getProjectProposalId(uint256 projectId) external view returns (uint256) { return projects[projectId].proposalId; }
-    function getProjectCreator(uint256 projectId) external view returns (address) { return projects[projectId].creator; }
-    function getProjectPayoutRecipient(uint256 projectId) external view returns (address) { return projects[projectId].payoutRecipient; }
-    function getProjectFundingAmount(uint256 projectId) external view returns (uint256) { return projects[projectId].fundingAmount; }
-    function getProjectFundingRemaining(uint256 projectId) external view returns (uint256) { return projects[projectId].fundingRemaining; }
-    function getProjectPerMilestoneCap(uint256 projectId) external view returns (uint256) { return projects[projectId].perMilestoneCap; }
-    function getProjectTrancheCeiling(uint256 projectId) external view returns (uint256) { return projects[projectId].trancheCeiling; }
-    function getProjectMilestoneCount(uint256 projectId) external view returns (uint32) { return projects[projectId].milestoneCount; }
-    function getProjectMilestonesCompleted(uint256 projectId) external view returns (uint32) { return projects[projectId].milestonesCompleted; }
-    function getProjectStartTime(uint256 projectId) external view returns (uint256) { return projects[projectId].startTime; }
-    function getProjectDeadline(uint256 projectId) external view returns (uint256) { return projects[projectId].deadline; }
-    function getProjectCompleted(uint256 projectId) external view returns (bool) { return projects[projectId].completed; }
-    function getProjectExpired(uint256 projectId) external view returns (bool) { return projects[projectId].expired; }
-    function getProjectLastMilestoneTime(uint256 projectId) external view returns (uint256) { return projects[projectId].lastMilestoneTime; }
-    function getProjectMissionDescription(uint256 projectId) external view returns (string memory) { return projects[projectId].missionDescription; }
+    /// @notice Whether `voter` has already voted on `proposalId`.
+    function hasVoted(uint256 proposalId, address voter) external view returns (bool) {
+        return _proposals[proposalId].hasVoted[voter];
+    }
 
-    function getMissionLedger(uint256 projectId) external view returns (MissionLedger memory) { return missionLedgers[projectId]; }
+    function getProjectId(uint256 projectId) external view returns (uint256) { return _projects[projectId].id; }
+    function getProjectProposalId(uint256 projectId) external view returns (uint256) { return _projects[projectId].proposalId; }
+    function getProjectCreator(uint256 projectId) external view returns (address) { return _projects[projectId].creator; }
+    function getProjectPayoutRecipient(uint256 projectId) external view returns (address) { return _projects[projectId].payoutRecipient; }
+    function getProjectFundingAmount(uint256 projectId) external view returns (uint256) { return _projects[projectId].fundingAmount; }
+    function getProjectFundingRemaining(uint256 projectId) external view returns (uint256) { return _projects[projectId].fundingRemaining; }
+    function getProjectPerMilestoneCap(uint256 projectId) external view returns (uint256) { return _projects[projectId].perMilestoneCap; }
+    function getProjectTrancheCeiling(uint256 projectId) external view returns (uint256) { return _projects[projectId].trancheCeiling; }
+    function getProjectMilestoneCount(uint256 projectId) external view returns (uint32) { return _projects[projectId].milestoneCount; }
+    function getProjectMilestonesCompleted(uint256 projectId) external view returns (uint32) { return _projects[projectId].milestonesCompleted; }
+    function getProjectStartTime(uint256 projectId) external view returns (uint256) { return _projects[projectId].startTime; }
+    function getProjectDeadline(uint256 projectId) external view returns (uint256) { return _projects[projectId].deadline; }
+    function getProjectCompleted(uint256 projectId) external view returns (bool) { return _projects[projectId].completed; }
+    function getProjectExpired(uint256 projectId) external view returns (bool) { return _projects[projectId].expired; }
+    function getProjectLastMilestoneTime(uint256 projectId) external view returns (uint256) { return _projects[projectId].lastMilestoneTime; }
+    function getProjectMissionDescription(uint256 projectId) external view returns (string memory) { return _projects[projectId].missionDescription; }
 
-    /// @notice Next timestamp at which the robot may authorise this project again.
+    /// @notice Cumulative real-world delivery attested for a project.
+    function getMissionLedger(uint256 projectId) external view returns (MissionLedger memory) {
+        return _missionLedgers[projectId];
+    }
+
+    /// @notice The next timestamp at which the robot may authorize this project again.
     function nextMilestoneUnlockTime(uint256 projectId) external view returns (uint256) {
-        Project storage project = projects[projectId];
+        Project storage project = _projects[projectId];
         if (project.id == 0) return 0;
         if (project.lastMilestoneTime == 0) return project.startTime;
         return project.lastMilestoneTime + MILESTONE_GATING_INTERVAL;
@@ -927,8 +1204,4 @@ contract BeeHabitatDAO is ReentrancyGuard {
     function getRobotMcuEcdsaSigner() external view returns (address) { return robot.mcuEcdsaSigner; }
     function getRobotOtsChainTip() external view returns (bytes32) { return robot.otsChainTip; }
     function getRobotOtsRemaining() external view returns (uint64) { return robot.otsRemaining; }
-
-    /// @dev Kept for interface compatibility with the pre-audit ABI.
-    function roomieRobotPqcPublicKeyHash() external view returns (bytes32) { return robot.pqcPublicKeyHash; }
-    function roomieRobotLocked() external view returns (bool) { return robot.provisioned; }
 }

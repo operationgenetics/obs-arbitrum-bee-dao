@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.28;
 
 import {BeeHabitatHarness} from "./Harness.sol";
 import {BeeHabitatDAO} from "../contracts/BeeHabitatDAO.sol";
@@ -21,13 +21,13 @@ contract BeeHabitatDAOFullAuditTest is BeeHabitatHarness {
         );
         vm.prank(daoMember);
         dao.vote(propId, true);
-        vm.warp(block.timestamp + 31 days);
+        vm.warp(vm.getBlockTimestamp() + 31 days);
 
-        vm.expectRevert("Vault not unlocked: 5B DAI threshold not reached");
+        vm.expectRevert(BeeHabitatDAO.VaultLocked.selector);
         dao.executeProposal(propId);
 
         vm.prank(ADMIN);
-        vm.expectRevert("Vault not unlocked: 5B DAI threshold not reached");
+        vm.expectRevert(BeeHabitatDAO.VaultLocked.selector);
         dao.robotAuthorizeAndReleaseMilestone(
             1, 1e18, _goodAttestation(), pqcPublicKey, _validPqcSignature(), new bytes(65), otsChain[OTS_LEN - 1]
         );
@@ -78,8 +78,8 @@ contract BeeHabitatDAOFullAuditTest is BeeHabitatHarness {
         vm.prank(daoMember);
         dao.vote(propId, true); // 100 LP < 110 LP quorum
 
-        vm.warp(block.timestamp + 31 days);
-        vm.expectRevert("Quorum not reached");
+        vm.warp(vm.getBlockTimestamp() + 31 days);
+        vm.expectRevert(BeeHabitatDAO.QuorumNotReached.selector);
         dao.executeProposal(propId);
     }
 
@@ -100,7 +100,7 @@ contract BeeHabitatDAOFullAuditTest is BeeHabitatHarness {
         vm.prank(daoMember2);
         dao.vote(propId, true);
 
-        vm.warp(block.timestamp + 31 days);
+        vm.warp(vm.getBlockTimestamp() + 31 days);
         uint256 pid = dao.executeProposal(propId);
         assertEq(pid, 1);
     }
@@ -122,8 +122,8 @@ contract BeeHabitatDAOFullAuditTest is BeeHabitatHarness {
         vm.prank(daoMember2);
         dao.vote(propId, false);
 
-        vm.warp(block.timestamp + 31 days);
-        vm.expectRevert("Proposal rejected: against votes exceed for votes");
+        vm.warp(vm.getBlockTimestamp() + 31 days);
+        vm.expectRevert(BeeHabitatDAO.ProposalRejected.selector);
         dao.executeProposal(propId);
     }
 
@@ -139,10 +139,10 @@ contract BeeHabitatDAOFullAuditTest is BeeHabitatHarness {
         );
         vm.prank(daoMember);
         dao.vote(propId, true);
-        vm.warp(block.timestamp + 31 days);
+        vm.warp(vm.getBlockTimestamp() + 31 days);
 
         dao.executeProposal(propId);
-        vm.expectRevert("Proposal already executed");
+        vm.expectRevert(BeeHabitatDAO.ProposalAlreadyExecuted.selector);
         dao.executeProposal(propId);
     }
 
@@ -159,7 +159,7 @@ contract BeeHabitatDAOFullAuditTest is BeeHabitatHarness {
         vm.prank(daoMember);
         dao.vote(propId, true);
 
-        vm.expectRevert("Voting period not ended");
+        vm.expectRevert(BeeHabitatDAO.VotingNotEnded.selector);
         dao.executeProposal(propId);
     }
 
@@ -176,9 +176,9 @@ contract BeeHabitatDAOFullAuditTest is BeeHabitatHarness {
         );
         vm.prank(daoMember);
         dao.vote(propId, true);
-        vm.warp(block.timestamp + 31 days);
+        vm.warp(vm.getBlockTimestamp() + 31 days);
 
-        vm.expectRevert("Exceeds max project share of vault");
+        vm.expectRevert(BeeHabitatDAO.ExceedsMaxProjectShare.selector);
         dao.executeProposal(propId);
     }
 
@@ -193,9 +193,9 @@ contract BeeHabitatDAOFullAuditTest is BeeHabitatHarness {
         );
         vm.prank(daoMember);
         dao.vote(propId, true);
-        vm.warp(block.timestamp + 31 days);
+        vm.warp(vm.getBlockTimestamp() + 31 days);
 
-        vm.expectRevert("Exceeds max project share of vault");
+        vm.expectRevert(BeeHabitatDAO.ExceedsMaxProjectShare.selector);
         dao.executeProposal(propId);
     }
 
@@ -215,7 +215,7 @@ contract BeeHabitatDAOFullAuditTest is BeeHabitatHarness {
 
         uint256 releasedTotal;
         for (uint32 i = 0; i < count; i++) {
-            if (i > 0) vm.warp(block.timestamp + 61 days);
+            if (i > 0) vm.warp(vm.getBlockTimestamp() + 61 days);
             uint256 remaining = dao.getProjectFundingRemaining(projectId);
             uint256 amount = remaining < cap ? remaining : cap;
             _releaseMilestone(projectId, amount);
@@ -230,16 +230,16 @@ contract BeeHabitatDAOFullAuditTest is BeeHabitatHarness {
         assertEq(dao.totalReservedForProjects(), 0);
 
         // Spending took at least 5 x 60 days: no instant drain, no instant price crash.
-        assertGe(block.timestamp - dao.getProjectStartTime(projectId), 5 * 60 days);
+        assertGe(vm.getBlockTimestamp() - dao.getProjectStartTime(projectId), 5 * 60 days);
 
         // A seventh authorisation is impossible: the schedule is exhausted.
-        vm.warp(block.timestamp + 61 days);
+        vm.warp(vm.getBlockTimestamp() + 61 days);
         BeeHabitatDAO.MilestoneAttestation memory att = _goodAttestation();
         bytes memory pqcSig = _validPqcSignature();
         bytes32 pre = otsChain[otsCursor];
         bytes memory sig = _mcuSign(projectId, 1e18, att, pqcSig, pre, mcuPrivKey);
         vm.prank(ADMIN);
-        vm.expectRevert("All milestones already completed");
+        vm.expectRevert(BeeHabitatDAO.AllMilestonesCompleted.selector);
         dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, pqcSig, sig, pre);
 
         vm.prank(ADMIN);
@@ -257,12 +257,12 @@ contract BeeHabitatDAOFullAuditTest is BeeHabitatHarness {
         uint256 projectId = _passProposal(60_000 * 1e18);
 
         vm.prank(ADMIN);
-        vm.expectRevert("All milestones must be delivered");
+        vm.expectRevert(BeeHabitatDAO.MilestonesIncomplete.selector);
         dao.completeProject(projectId);
 
         _releaseMilestone(projectId, 1e18);
         vm.prank(ADMIN);
-        vm.expectRevert("All milestones must be delivered");
+        vm.expectRevert(BeeHabitatDAO.MilestonesIncomplete.selector);
         dao.completeProject(projectId);
     }
 
@@ -333,7 +333,7 @@ contract BeeHabitatDAOFullAuditTest is BeeHabitatHarness {
         _unlockVault();
         uint256 projectId = _passProposal(60_000 * 1e18);
 
-        vm.expectRevert("Project deadline not reached");
+        vm.expectRevert(BeeHabitatDAO.ProjectDeadlineNotReached.selector);
         dao.checkProjectTimeout(projectId);
     }
 
@@ -352,7 +352,7 @@ contract BeeHabitatDAOFullAuditTest is BeeHabitatHarness {
         bytes memory sig = _mcuSign(projectId, 1e18, att, pqcSig, pre, mcuPrivKey);
 
         vm.prank(ADMIN);
-        vm.expectRevert("Project expired");
+        vm.expectRevert(BeeHabitatDAO.ProjectHasExpired.selector);
         dao.robotAuthorizeAndReleaseMilestone(projectId, 1e18, att, pqcPublicKey, pqcSig, sig, pre);
     }
 
@@ -386,7 +386,7 @@ contract BeeHabitatDAOFullAuditTest is BeeHabitatHarness {
         fresh.revokeAndUpdateImmutability();
 
         vm.prank(ADMIN);
-        vm.expectRevert("Robot configuration is permanently immutable");
+        vm.expectRevert(BeeHabitatDAO.ConfigurationImmutable.selector);
         fresh.commissionRoomieRobot(pqcPublicKeyHash, mcuSigner, otsChain[OTS_LEN], uint64(OTS_LEN));
 
         assertFalse(fresh.isRobotCommissioned());
@@ -404,7 +404,7 @@ contract BeeHabitatDAOFullAuditTest is BeeHabitatHarness {
         _releaseMilestone(projectId, 5_000 * 1e18);
         assertEq(dao.totalObsVaultBalance(), obs.balanceOf(address(dao)));
 
-        vm.warp(block.timestamp + 61 days);
+        vm.warp(vm.getBlockTimestamp() + 61 days);
         _releaseMilestone(projectId, 5_000 * 1e18);
         assertEq(dao.totalObsVaultBalance(), obs.balanceOf(address(dao)));
         assertEq(dao.totalObsReleased(), 10_000 * 1e18);
@@ -427,9 +427,9 @@ contract BeeHabitatDAOFullAuditTest is BeeHabitatHarness {
         );
         vm.prank(daoMember2);
         dao.vote(propId, true);
-        vm.warp(block.timestamp + 31 days);
+        vm.warp(vm.getBlockTimestamp() + 31 days);
 
-        vm.expectRevert("Exceeds max project share of vault");
+        vm.expectRevert(BeeHabitatDAO.ExceedsMaxProjectShare.selector);
         dao.executeProposal(propId);
 
         assertLe(dao.totalReservedForProjects(), dao.totalObsVaultBalance());
